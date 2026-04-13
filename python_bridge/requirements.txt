@@ -1,0 +1,8 @@
+# MetaTrader 5 Python package
+MetaTrader5==5.0.47
+
+# ZeroMQ Python bindings
+pyzmq==26.2.0
+
+# Optional: for better performance
+# uvloop==0.21.0  # Linux/macOS only
