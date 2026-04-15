@@ -11,7 +11,8 @@ from collections import defaultdict
 SYMBOL = "GOLD"
 PORT = 5556
 CHECK_INTERVAL = 0.5  # Giây
-BATCH_INFO_FILE = "scripts/batch_info.json"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BATCH_INFO_FILE = os.path.join(SCRIPT_DIR, "batch_info.json")
 
 
 class OrderClient:
@@ -86,10 +87,49 @@ def load_batch_info():
 def save_batch_info(batch_info):
     """Lưu batch info vào file JSON."""
     try:
+        os.makedirs(os.path.dirname(BATCH_INFO_FILE), exist_ok=True)
+    except Exception:
+        pass
+
+    try:
         with open(BATCH_INFO_FILE, 'w') as f:
             json.dump(batch_info, f, indent=2)
-    except:
+    except Exception:
         pass
+
+
+def parse_comment(comment: str):
+    """Parse comment string like 'Magic:1000|Target:1.0' -> (magic:int, target:float|str)
+
+    Returns (magic, target). If values can't be parsed, returns defaults (0, '?').
+    """
+    magic = 0
+    target = '?'
+    if not comment:
+        return magic, target
+
+    try:
+        parts = comment.split('|')
+        for p in parts:
+            if ':' not in p:
+                continue
+            k, v = p.split(':', 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if k == 'magic':
+                try:
+                    magic = int(v)
+                except Exception:
+                    pass
+            elif k in ('target', 'pnl_target'):
+                try:
+                    target = float(v)
+                except Exception:
+                    target = v
+    except Exception:
+        pass
+
+    return magic, target
 
 
 def main():

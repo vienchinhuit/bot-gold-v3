@@ -11,7 +11,8 @@ import os
 _current_magic = 1000
 
 # File lưu batch info
-BATCH_INFO_FILE = "scripts/batch_info.json"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BATCH_INFO_FILE = os.path.join(SCRIPT_DIR, "batch_info.json")
 
 def get_next_magic():
     global _current_magic
@@ -21,21 +22,30 @@ def get_next_magic():
 def save_batch_info(magic, pnl_target, tickets):
     """Lưu batch info vào file JSON."""
     batch_info = {}
+    # Ensure directory exists
+    try:
+        os.makedirs(os.path.dirname(BATCH_INFO_FILE), exist_ok=True)
+    except Exception:
+        pass
+
     if os.path.exists(BATCH_INFO_FILE):
         try:
             with open(BATCH_INFO_FILE, 'r') as f:
                 batch_info = json.load(f)
-        except:
+        except Exception:
             batch_info = {}
-    
+
     # Lưu tickets theo magic với target
     batch_info[str(magic)] = {
         "pnl_target": pnl_target,
         "tickets": tickets
     }
-    
-    with open(BATCH_INFO_FILE, 'w') as f:
-        json.dump(batch_info, f, indent=2)
+
+    try:
+        with open(BATCH_INFO_FILE, 'w') as f:
+            json.dump(batch_info, f, indent=2)
+    except Exception as e:
+        print(f"Failed to save batch info to {BATCH_INFO_FILE}: {e}")
 
 def remove_batch_info(magic):
     """Xóa batch info sau khi đóng xong."""
@@ -45,11 +55,14 @@ def remove_batch_info(magic):
                 batch_info = json.load(f)
         else:
             batch_info = {}
-        
+
         if str(magic) in batch_info:
             del batch_info[str(magic)]
-            with open(BATCH_INFO_FILE, 'w') as f:
-                json.dump(batch_info, f, indent=2)
+            try:
+                with open(BATCH_INFO_FILE, 'w') as f:
+                    json.dump(batch_info, f, indent=2)
+            except Exception as e:
+                print(f"Failed to update batch info file: {e}")
     except Exception as e:
         print(f"Error removing batch info: {e}")
 
