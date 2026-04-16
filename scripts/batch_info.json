@@ -1,11 +1,21 @@
 {
   "2000": {
-    "pnl_target": 1.0,
-    "tickets": []
+    "pnl_target": 0.99,
+    "tickets": [],
+    "closed_count": 1,
+    "closed_pnl": 1.04
+  },
+  "2100": {
+    "pnl_target": 0.99,
+    "tickets": [],
+    "closed_count": 42,
+    "closed_pnl": 45.580000000000005
   },
   "3500": {
-    "pnl_target": 1.0,
-    "tickets": []
+    "pnl_target": 0.99,
+    "tickets": [],
+    "closed_count": 0,
+    "closed_pnl": 0.0
   },
   "3600": {
     "pnl_target": 1.0,
@@ -54,7 +64,9 @@
       205148873,
       205148884,
       205148889
-    ]
+    ],
+    "closed_count": 0,
+    "closed_pnl": 0.0
   },
   "3700": {
     "pnl_target": 10.0,
@@ -80,17 +92,23 @@
       205150447,
       205150502,
       205150666
-    ]
+    ],
+    "closed_count": 0,
+    "closed_pnl": 0.0
   },
   "3800": {
     "pnl_target": 100.0,
-    "tickets": []
+    "tickets": [],
+    "closed_count": 0,
+    "closed_pnl": 0.0
   },
   "3900": {
     "pnl_target": 100.0,
     "tickets": [
       205152916
-    ]
+    ],
+    "closed_count": 0,
+    "closed_pnl": 0.0
   },
   "4000": {
     "pnl_target": 200.0,
@@ -103,20 +121,35 @@
       205156808,
       205156810,
       205156886
-    ]
+    ],
+    "closed_count": 0,
+    "closed_pnl": 0.0
   },
   "4100": {
     "pnl_target": 200.0,
-    "tickets": []
+    "tickets": [],
+    "closed_count": 0,
+    "closed_pnl": 0.0
   },
   "4200": {
     "pnl_target": 1.0,
     "tickets": [
       205228439
-    ]
+    ],
+    "closed_count": 0,
+    "closed_pnl": 0.0
   },
   "1100": {
     "pnl_target": 1.0,
-    "tickets": []
+    "tickets": [],
+    "closed_count": 0,
+    "closed_pnl": 0.0
+  },
+  "2200": {
+    "closed_count": 8,
+    "closed_pnl": 13.660000000000002
+  },
+  "2300": {
+    "closed_count": 8,
+    "closed_pnl": 13.860000000000001
   }
-}
