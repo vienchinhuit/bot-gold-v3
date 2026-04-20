@@ -11,8 +11,8 @@ from collections import defaultdict
 SYMBOL = "GOLD"
 PORT = 5556
 CHECK_INTERVAL = 0.2  # Giây
-STOP_LOSS = 0  # Đặt >0 để tự đóng khi lỗ (VD: 10 = đóng khi lỗ $10), đặt 0 để tắt
-BATCH_PROFIT_TARGET = 10.0  # Tổng PNL đạt target này sẽ đóng toàn bộ batch (đặt 0 để tắt)
+STOP_LOSS = 100  # Đặt >0 để tự đóng khi lỗ (VD: 10 = đóng khi lỗ $10), đặt 0 để tắt
+BATCH_PROFIT_TARGET = 100.0  # Tổng PNL đạt target này sẽ đóng toàn bộ batch (đặt 0 để tắt)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BATCH_INFO_FILE = os.path.join(SCRIPT_DIR, "batch_info.json")
 

@@ -12,6 +12,7 @@ if __package__:
     from .zmq_publisher import ZMQManager
     from .models import MessageType, OrderRequest, OrderResponse
     from .logger import get_system_logger, get_market_logger, get_order_logger
+    from datetime import date
 else:
     from mt5_connector import MT5Connector
     from zmq_publisher import ZMQManager
@@ -175,6 +176,8 @@ class OrderWorker:
                 return self._handle_order_send(data)
             elif msg_type == MessageType.POSITION_CLOSE.value:
                 return self._handle_position_close(data)
+            elif msg_type == MessageType.POSITION_CLOSE_BATCH.value:
+                return self._handle_position_close_batch(data)
             elif msg_type == MessageType.POSITION_MODIFY.value:
                 return self._handle_position_modify(data)
             elif msg_type == MessageType.ORDER_INFO.value:
@@ -233,6 +236,113 @@ class OrderWorker:
             self._order_logger.error(f"CLOSE FAILED: {response.error_message}")
         
         return response.to_json()
+    
+    def _handle_position_close_batch(self, data: dict):
+        """Handle batch position close request - parallel execution."""
+        tickets = data.get('tickets', [])
+        max_workers = int(data.get('max_workers', 10))
+        save_history = data.get('save_history', True)  # Mặc định lưu history
+        
+        if not tickets:
+            return json.dumps({
+                'success': False,
+                'error': 'No tickets provided',
+                'closed': 0,
+                'failed': 0
+            })
+        
+        self._order_logger.info(
+            f"Processing POSITION_CLOSE_BATCH: {len(tickets)} positions, "
+            f"max_workers={max_workers}"
+        )
+        
+        # Lấy thông tin positions TRƯỚC KHI đóng (để lưu history)
+        positions_info = {}
+        for ticket in tickets:
+            pos_list = self.mt5.get_positions()
+            for pos in pos_list:
+                if pos['ticket'] == ticket:
+                    positions_info[ticket] = {
+                        'symbol': pos['symbol'],
+                        'type': pos['type'],
+                        'volume': pos['volume'],
+                        'price_open': pos['price_open'],
+                        'profit': pos['profit'],
+                        'magic': pos['magic'],
+                        'comment': pos['comment']
+                    }
+                    break
+        
+        result = self.mt5.close_positions_parallel(tickets, max_workers)
+        
+        if result['success']:
+            self._order_logger.info(
+                f"BATCH CLOSE SUCCESS: {result['closed']}/{len(tickets)} closed"
+            )
+        else:
+            self._order_logger.warning(
+                f"BATCH CLOSE PARTIAL: {result['closed']} OK, {result['failed']} failed"
+            )
+        
+        # Lưu history cho các position đã đóng thành công
+        if save_history and result.get('results'):
+            self._save_batch_history(result['results'], positions_info)
+        
+        return json.dumps(result)
+    
+    def _save_batch_history(self, results: list, positions_info: dict):
+        """Lưu batch close vào history file."""
+        try:
+            import os
+            import json as json_module
+            
+            # Xác định đường dẫn history file
+            script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            history_file = os.path.join(script_dir, "scripts", "order_history.json")
+            
+            # Đọc history hiện tại
+            history = []
+            if os.path.exists(history_file):
+                try:
+                    with open(history_file, 'r', encoding='utf-8') as f:
+                        history = json_module.load(f)
+                        if not isinstance(history, list):
+                            history = []
+                except (json_module.JSONDecodeError, FileNotFoundError):
+                    history = []
+            
+            # Thêm các records mới
+            for res in results:
+                if res.get('success'):
+                    ticket = res.get('ticket')
+                    pos_info = positions_info.get(ticket, {})
+                    
+                    record = {
+                        'id': datetime.now().strftime('%Y%m%d%H%M%S%f'),
+                        'ticket': ticket,
+                        'symbol': pos_info.get('symbol', 'GOLD'),
+                        'type': pos_info.get('type', 'UNKNOWN'),
+                        'volume': pos_info.get('volume', 0),
+                        'price_open': pos_info.get('price_open', 0),
+                        'price_close': res.get('price', 0),
+                        'pnl': pos_info.get('profit', 0),
+                        'magic': pos_info.get('magic', 0),
+                        'comment': pos_info.get('comment', ''),
+                        'close_mode': 'batch',
+                        'closed_at': datetime.now().isoformat(),
+                        'date': date.today().isoformat()
+                    }
+                    history.insert(0, record)
+            
+            # Lưu lại
+            os.makedirs(os.path.dirname(history_file), exist_ok=True)
+            with open(history_file, 'w', encoding='utf-8') as f:
+                json_module.dump(history, f, indent=2, ensure_ascii=False)
+            
+            self._order_logger.info(f"Saved {len([r for r in results if r.get('success')])} records to history")
+            
+        except Exception as e:
+            self._order_logger.error(f"Failed to save history: {e}")
     
     def _handle_position_modify(self, data: dict):
         """Handle position modify request."""

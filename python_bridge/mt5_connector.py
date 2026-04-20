@@ -3,6 +3,8 @@
 import MetaTrader5 as mt5
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import time
 
 # Support both relative and absolute imports
@@ -316,6 +318,92 @@ class MT5Connector:
                 error_message=error_msg,
                 request_id=str(ticket)
             )
+    
+    def close_positions_parallel(self, tickets: List[int], max_workers: int = 10) -> Dict[str, Any]:
+        """Close multiple positions in parallel using thread pool.
+        
+        Args:
+            tickets: List of position tickets to close
+            max_workers: Maximum concurrent close operations (default: 10)
+            
+        Returns:
+            Summary dict with closed/failed counts and detailed results
+        """
+        if not tickets:
+            return {
+                'success': True, 
+                'closed': 0, 
+                'failed': 0, 
+                'results': [],
+                'errors': []
+            }
+        
+        self._system_logger.info(f"PARALLEL CLOSE: Starting {len(tickets)} positions with {max_workers} workers")
+        
+        # Thread-local storage for results
+        results = []
+        results_lock = threading.Lock()
+        
+        def close_single(ticket: int) -> dict:
+            """Close a single position (runs in thread)."""
+            try:
+                response = self.close_position(ticket, volume=0)
+                return {
+                    'ticket': ticket,
+                    'success': response.success,
+                    'price': response.price if response.success else None,
+                    'error': response.error_message if not response.success else None
+                }
+            except Exception as e:
+                return {
+                    'ticket': ticket,
+                    'success': False,
+                    'error': f"Thread exception: {str(e)}"
+                }
+        
+        # Use thread pool for parallel execution
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(tickets))) as executor:
+            # Submit all tasks
+            futures = {executor.submit(close_single, ticket): ticket for ticket in tickets}
+            
+            # Collect results as they complete
+            for future in as_completed(futures):
+                ticket = futures[future]
+                try:
+                    result = future.result()
+                    with results_lock:
+                        results.append(result)
+                    
+                    if result['success']:
+                        self._system_logger.info(f"  PARALLEL CLOSE OK: #{ticket} @ {result.get('price')}")
+                    else:
+                        self._system_logger.error(f"  PARALLEL CLOSE FAIL: #{ticket} - {result.get('error')}")
+                        
+                except Exception as e:
+                    with results_lock:
+                        results.append({
+                            'ticket': ticket,
+                            'success': False,
+                            'error': f"Future exception: {str(e)}"
+                        })
+        
+        # Summarize
+        closed = sum(1 for r in results if r.get('success'))
+        failed = len(results) - closed
+        errors = [r for r in results if not r.get('success')]
+        
+        self._system_logger.info(
+            f"PARALLEL CLOSE COMPLETE: {closed}/{len(tickets)} OK, {failed} failed"
+        )
+        
+        return {
+            'success': failed == 0,
+            'closed': closed,
+            'failed': failed,
+            'results': results,
+            'errors': errors,
+            'timestamp': datetime.now().isoformat()
+        }
     
     def modify_position(self, ticket: int, stop_loss: float = None,
                         take_profit: float = None) -> OrderResponse:
