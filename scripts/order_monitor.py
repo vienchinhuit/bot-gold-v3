@@ -11,8 +11,55 @@ from collections import defaultdict
 SYMBOL = "GOLD"
 PORT = 5556
 CHECK_INTERVAL = 0.2  # Giây
-STOP_LOSS = 100  # Đặt >0 để tự đóng khi lỗ (VD: 10 = đóng khi lỗ $10), đặt 0 để tắt
-BATCH_PROFIT_TARGET = 100.0  # Tổng PNL đạt target này sẽ đóng toàn bộ batch (đặt 0 để tắt)
+
+# Slack notification settings (ZMQ PUB)
+SLACK_NOTIFY_PORT = 5557  # Port để gửi close notifications đến Rust engine (0 = disable)
+
+
+class SlackNotifier:
+    """"Gửi notification qua ZMQ đến Rust engine để forward qua Slack."""
+    
+    def __init__(self, port=5557):
+        self.port = port
+        self.context = None
+        self.socket = None
+        if port > 0:
+            try:
+                self.context = zmq.Context()
+                self.socket = self.context.socket(zmq.PUB)
+                # Ensure messages are not queued after close
+                self.socket.setsockopt(zmq.LINGER, 0)
+                self.socket.bind(f"tcp://*:{port}")
+                # Give subscriber a moment to connect
+                time.sleep(0.1)
+                print(f"Slack notifier: TCP *:{port} (PUB)")
+            except Exception as e:
+                print(f"Slack notifier: Failed to bind port {port}: {e}")
+                self.socket = None
+    
+    def send_close_notify(self, ticket, direction, volume, price, profit, magic):
+        """Gửi notification khi position được đóng."""
+        if not self.socket:
+            return
+        try:
+            # Format: CLOSE_NOTIFY|ticket|direction|volume|price|profit|magic
+            msg = f"CLOSE_NOTIFY|{ticket}|{direction}|{volume}|{price}|{profit}|{magic}"
+            self.socket.send_string(msg)
+            print(f"  [SLACK] Notified: #{ticket} {direction} {volume} lots @ {price} P&L: ${profit:+.2f}")
+        except Exception as e:
+            print(f"  [SLACK] Failed to send: {e}")
+    
+    def close(self):
+        if self.socket:
+            self.socket.close()
+        if self.context:
+            self.context.term()
+
+
+def get_all_positions(client, symbol=None):
+        pass
+STOP_LOSS = 0  # Đặt >0 để tự đóng khi lỗ (VD: 10 = đóng khi lỗ $10), đặt 0 để tắt
+BATCH_PROFIT_TARGET = 1000.0  # Tổng PNL đạt target này sẽ đóng toàn bộ batch (đặt 0 để tắt)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BATCH_INFO_FILE = os.path.join(SCRIPT_DIR, "batch_info.json")
 
@@ -73,6 +120,19 @@ def close_position(client, ticket):
     """Close a specific position."""
     client.send("POSITION_CLOSE", {"ticket": ticket, "volume": 0})
     return client.get_response(timeout=10)
+
+def get_position_profit(client, ticket) -> float:
+    """Query MT5 for the realized profit of a closed position.
+    Returns 0.0 if the request fails.
+    """
+    client.send("POSITION_GET", {"ticket": ticket})
+    resp = client.get_response(timeout=5)
+    if resp and resp.get("success"):
+        try:
+            return float(resp.get("profit", 0.0))
+        except Exception:
+            return 0.0
+    return 0.0
 
 
 def load_batch_info():
@@ -165,6 +225,7 @@ def main():
     print()
     
     client = OrderClient(port=PORT)
+    slack_notifier = SlackNotifier(port=SLACK_NOTIFY_PORT)
     
     # Reset batch info khi khởi chạy
     batch_info = load_batch_info()
@@ -277,6 +338,15 @@ def main():
                         
                         if resp and resp.get('success'):
                             print(f"    SUCCESS!")
+                            # Gửi Slack notification
+                            slack_notifier.send_close_notify(
+                                ticket=pos['ticket'],
+                                direction=pos.get('type', 'UNKNOWN'),
+                                volume=pos.get('volume', 0),
+                                price=pos.get('price_open', 0),
+                                profit=pos['profit'],
+                                magic=pos.get('magic', 0)
+                            )
                             total_pnl_achieved += pos['profit']
                             total_closed += 1
                             global_closed_pnl += pos['profit']
@@ -305,6 +375,15 @@ def main():
                         
                         if resp and resp.get('success'):
                             print(f"    SUCCESS!")
+                            # Gửi Slack notification
+                            slack_notifier.send_close_notify(
+                                ticket=pos['ticket'],
+                                direction=pos.get('type', 'UNKNOWN'),
+                                volume=pos.get('volume', 0),
+                                price=pos.get('price_open', 0),
+                                profit=pos['profit'],
+                                magic=pos.get('magic', 0)
+                            )
                             total_pnl_achieved += pos['profit']
                             total_closed += 1
                             global_closed_pnl += pos['profit']
@@ -340,6 +419,15 @@ def main():
                             
                             if resp and resp.get('success'):
                                 print(f"    SUCCESS!")
+                                # Gửi Slack notification
+                                slack_notifier.send_close_notify(
+                                    ticket=pos['ticket'],
+                                    direction=pos.get('type', 'UNKNOWN'),
+                                    volume=pos.get('volume', 0),
+                                    price=pos.get('price_open', 0),
+                                    profit=pos['profit'],
+                                    magic=pos.get('magic', 0)
+                                )
                                 total_pnl_achieved += pos['profit']
                                 total_closed += 1
                                 global_closed_pnl += pos['profit']
@@ -388,6 +476,7 @@ def main():
     print("=" * 60)
     
     client.close()
+    slack_notifier.close()
 
 
 if __name__ == "__main__":

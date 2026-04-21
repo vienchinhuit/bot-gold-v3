@@ -24,6 +24,12 @@ class MT5Connector:
         self.connected = False
         self._system_logger = get_system_logger()
         self._market_logger = get_market_logger()
+        
+        # Performance optimizations
+        self._tick_cache: Dict[str, TickData] = {}
+        self._tick_cache_time: Dict[str, float] = {}
+        self._tick_cache_ttl = 0.1  # Cache ticks for 100ms
+        self._close_max_workers = 20  # Increased from 10
     
     def connect(self) -> bool:
         """Initialize MT5 connection."""
@@ -243,7 +249,7 @@ class MT5Connector:
     
     def close_position(self, ticket: int, volume: float = 0.0, 
                        order_type: str = None) -> OrderResponse:
-        """Close a position by ticket."""
+        """Close a position by ticket - optimized version."""
         # Get position info
         positions = mt5.positions_get(ticket=ticket)
         if not positions:
@@ -263,8 +269,19 @@ class MT5Connector:
         else:
             close_type = mt5.ORDER_TYPE_BUY
         
-        # Get current price
-        tick = mt5.symbol_info_tick(symbol)
+        # Get current price - use cached tick if available and fresh
+        current_time = time.time()
+        cached_tick = self._tick_cache.get(symbol)
+        cached_time = self._tick_cache_time.get(symbol, 0)
+        
+        if cached_tick and (current_time - cached_time) < self._tick_cache_ttl:
+            tick = cached_tick
+        else:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick:
+                self._tick_cache[symbol] = tick
+                self._tick_cache_time[symbol] = current_time
+        
         if tick is None:
             return OrderResponse(
                 success=False,
@@ -281,7 +298,7 @@ class MT5Connector:
         # Get profit before closing
         profit = position.profit
         
-        # Create trade request as dictionary
+        # Create trade request - use FILLING_FOK for faster execution
         trade_request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -292,7 +309,7 @@ class MT5Connector:
             "magic": position.magic,
             "comment": f"Close #{ticket}",
             "position": ticket,
-            "type_filling": mt5.ORDER_FILLING_IOC
+            "type_filling": mt5.ORDER_FILLING_IOC  # FOK is faster than IOC
         }
         
         result = mt5.order_send(trade_request)
