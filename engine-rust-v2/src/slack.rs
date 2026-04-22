@@ -190,7 +190,7 @@ impl SlackClient {
         self.send_attachment(attachment)
     }
 
-    /// Send position closed notification
+    /// Send position closed notification (backward compatible)
     pub fn send_position_closed(
         &self,
         ticket: &str,
@@ -200,24 +200,44 @@ impl SlackClient {
         profit: f64,
         magic: i32,
     ) -> Result<(), String> {
+        self.send_position_closed_with_reason(ticket, direction, volume, price, profit, magic, "CLOSE")
+    }
+
+    /// Send position closed notification with reason (TP/SL/MANUAL/BATCH)
+    pub fn send_position_closed_with_reason(
+        &self,
+        ticket: &str,
+        direction: &str,
+        volume: f64,
+        price: f64,
+        profit: f64,
+        magic: i32,
+        reason: &str,
+    ) -> Result<(), String> {
         if !self.enabled.load(Ordering::SeqCst) {
             return Ok(());
         }
 
-        let (color, emoji) = if profit >= 0.0 {
-            ("#00FF00", ":white_check_mark:")  // Green for profit
-        } else {
-            ("#FF0000", ":x:")  // Red for loss
+        let (color, emoji, reason_emoji) = match (profit >= 0.0, reason) {
+            (true, "TP") => ("#00FF00", ":trophy:", ":trophy:"),
+            (true, _) => ("#00FF00", ":white_check_mark:", ":chart_with_upwards_trend:"),
+            (false, "SL") => ("#FF0000", ":skull:", ":fire:"),
+            (false, _) => ("#FF0000", ":x:", ":chart_with_downwards_trend:"),
         };
 
         let pnl_text = format!("${:.2}", profit);
-        let pnl_emoji = if profit >= 0.0 { ":chart_with_upwards_trend:" } else { ":chart_with_downwards_trend:" };
-
+        let reason_label = match reason {
+            "TP" => "TAKE PROFIT",
+            "SL" => "STOP LOSS",
+            "MANUAL" => "MANUAL CLOSE",
+            "BATCH" => "BATCH CLOSE",
+            _ => "CLOSED",
+        };
 
         let attachment = SlackAttachment {
             color: color.to_string(),
-            title: format!("{} POSITION CLOSED: {} {} lots @ {:.2}", emoji, direction, volume, price),
-            text: format!("Ticket: {} | Magic: {} | P&L: {} {}", ticket, magic, pnl_emoji, pnl_text),
+            title: format!("{} POSITION {}: {} {} lots @ {:.2}", emoji, reason_label, direction, volume, price),
+            text: format!("Ticket: {} | Magic: {} | P&L: {} {}", ticket, magic, reason_emoji, pnl_text),
             fields: vec![
                 SlackField {
                     title: "Direction".to_string(),
@@ -240,6 +260,11 @@ impl SlackClient {
                     short: true,
                 },
                 SlackField {
+                    title: "Close Reason".to_string(),
+                    value: reason_label.to_string(),
+                    short: true,
+                },
+                SlackField {
                     title: "Magic".to_string(),
                     value: format!("{}", magic),
                     short: true,
@@ -248,7 +273,6 @@ impl SlackClient {
             footer: "GOLD Scalping Bot v2.0".to_string(),
             ts: chrono::Utc::now().timestamp(),
         };
-
 
         self.send_attachment(attachment)
     }
@@ -273,6 +297,41 @@ impl SlackClient {
             title: format!("{} ORDER EXECUTED: {} {} lots @ {:.2}", emoji, direction, volume, price),
             text: format!("Order ID: {}", order_id),
             fields: vec![],
+            footer: "GOLD Scalping Bot v2.0".to_string(),
+            ts: chrono::Utc::now().timestamp(),
+        };
+
+        self.send_attachment(attachment)
+    }
+
+    /// Send order request notification (before sending to MT5) - useful to track attempted opens
+    pub fn send_order_request(&self, direction: &str, volume: f64, price: f64, sl: Option<f64>, tp: Option<f64>, request_id: &str) -> Result<(), String> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let color = "#FFD700"; // gold
+        let emoji = ":arrow_forward:";
+
+        let mut fields = vec![
+            SlackField { title: "Direction".to_string(), value: direction.to_string(), short: true },
+            SlackField { title: "Volume".to_string(), value: format!("{:.2}", volume), short: true },
+            SlackField { title: "Price".to_string(), value: format!("{:.2}", price), short: true },
+            SlackField { title: "RequestId".to_string(), value: request_id.to_string(), short: true },
+        ];
+
+        if let Some(slv) = sl {
+            fields.push(SlackField { title: "SL".to_string(), value: format!("{:.2}", slv), short: true });
+        }
+        if let Some(tpv) = tp {
+            fields.push(SlackField { title: "TP".to_string(), value: format!("{:.2}", tpv), short: true });
+        }
+
+        let attachment = SlackAttachment {
+            color: color.to_string(),
+            title: format!("{} ORDER REQUEST: {} {} lots", emoji, direction, volume),
+            text: format!("Request id: {}", request_id),
+            fields,
             footer: "GOLD Scalping Bot v2.0".to_string(),
             ts: chrono::Utc::now().timestamp(),
         };
@@ -312,6 +371,24 @@ impl SlackClient {
             color: "#808080".to_string(),
             title: ":heartbeat: Bot Status".to_string(),
             text: message.to_string(),
+            fields: vec![],
+            footer: "GOLD Scalping Bot v2.0".to_string(),
+            ts: chrono::Utc::now().timestamp(),
+        };
+
+        self.send_attachment(attachment)
+    }
+
+    /// Send optimizer update notification
+    pub fn send_optimizer_update(&self, title: &str, result_text: &str) -> Result<(), String> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let attachment = SlackAttachment {
+            color: "#2E86FF".to_string(),
+            title: format!(":gear: {}", title),
+            text: result_text.to_string(),
             fields: vec![],
             footer: "GOLD Scalping Bot v2.0".to_string(),
             ts: chrono::Utc::now().timestamp(),

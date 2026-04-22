@@ -6,10 +6,10 @@
     "closed_pnl": 0.0
   },
   "2100": {
-    "pnl_target": 200.1,
+    "pnl_target": 50.0,
     "tickets": [],
     "closed_count": 1,
-    "closed_pnl": 204.0
+    "closed_pnl": 54.0
   },
   "2200": {
     "pnl_target": 10.2,

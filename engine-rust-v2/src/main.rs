@@ -4,15 +4,20 @@
 
 use clap::Parser;
 use chrono::{DateTime, NaiveDateTime, Utc, Local};
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 use std::time::Duration;
 use std::thread;
+use std::fs;
 use uuid::Uuid;
 use log::{info, warn, debug, error};
 use env_logger::Env;
 
 mod strategy_new;
 mod slack;
+mod optimizer;
+mod log_writer;
+
+
 use slack::SlackClient;
 use strategy_new::{
     Config, State, Candle, SignalAction, Direction,
@@ -20,7 +25,13 @@ use strategy_new::{
     is_pullback, detect_structure,
     SwingType,
 };
+use optimizer::{OptimizerConfig, OptimizationResult, optimize_from_logs, save_optimization_result, load_trade_logs, load_optimization_result};
+
+use log_writer::{make_strategy_row, append_strategy_log};
+
+
 use serde_json::Value;
+use std::time::Instant;
 
 /// Advanced Scalping Engine v2.0
 /// Strategy: Market Structure + Pullback + Scoring System
@@ -125,12 +136,77 @@ struct Args {
     
         /// Slack channel (e.g., #trading, #alerts)
     #[arg(long, default_value = "#trading")]
-    slack_channel: String,
+        slack_channel: String,
     
     /// Port to receive position close notifications (for Slack)
+
     #[arg(long, default_value_t = 0)]
     slack_notify_port: u16,
+
+        /// Enable auto optimization from log file at startup
+    #[arg(long, default_value_t = false)]
+    auto_optimize: bool,
+
+    /// Path to strategy log JSON file
+    #[arg(long, default_value = "strategy_logs.json")]
+    strategy_log_file: String,
+
+    /// Path to save optimization result JSON
+        #[arg(long, default_value = "optimizer_result.json")]
+        optimizer_output_file: String,
+
+        /// Path to append live strategy JSON logs
+        #[arg(long, default_value = "strategy_logs.json")]
+        live_log_file: String,
+
+        /// Auto reload optimized config during runtime
+        #[arg(long, default_value_t = true)]
+        auto_reload_optimized_config: bool,
+
+                /// Seconds between optimizer reload checks
+        #[arg(long, default_value_t = 60)]
+        optimizer_reload_sec: u64,
+
+        /// Force apply a loose starter config at launch (useful for demo/testing)
+        #[arg(long, default_value_t = false)]
+        loose_start: bool,
+
+        /// Log per-tick analysis (debug-level) each tick
+        #[arg(long, default_value_t = false)]
+        per_tick_log: bool,
+
+
+        /// Path to load historical M1 candles (JSON array) - optional
+        #[arg(long, default_value = "mt5_history.json")]
+        history_file: String,
+
+        /// Number of historical candles to load (most recent N)
+        #[arg(long, default_value_t = 500)]
+        history_count: usize,
+
+        /// If true, require history to be loaded at startup (exit if not loaded)
+        #[arg(long, default_value_t = false)]
+        require_history: bool,
+
+        /// Seconds to wait for history load when using MT5 bridge
+        #[arg(long, default_value_t = 30)]
+        history_wait_sec: u64,
+
+            /// Use local Python MT5 bridge to fetch history at startup (requires python MetaTrader5 package)
+        #[arg(long, default_value_t = false)]
+        use_mt5_bridge: bool,
+
+        /// Path to the python bridge script to call (default: python_bridge/mt5_bridge.py)
+        #[arg(long, default_value = "python_bridge/mt5_bridge.py")]
+        mt5_bridge_script: String,
+
+        /// Symbol name to request from MT5 bridge (if use_mt5_bridge=true)
+        #[arg(long, default_value = "GOLD")]
+        mt5_symbol: String,
 }
+
+
+
 
 /// Candle builder for M1 timeframe
 struct CandleBuilder {
@@ -264,10 +340,9 @@ fn main() {
     } else {
         info!("Position Close Notify: DISABLED");
     }
-    info!("============================================================");
-    
-    // Initialize configuration
-    let config = Config {
+        info!("============================================================");
+
+        let mut config = Config {
         ema_fast: 20,
         ema_slow: 50,
         rsi_period: 14,
@@ -288,13 +363,214 @@ fn main() {
         min_confidence: args.min_confidence,
         sl_mult: args.sl_mult,
         tp_mult: args.tp_mult,
-        pip_value: 0.01,  // XAUUSD
+        pip_value: 0.01,
         cooldown_after_loss: args.cooldown_candles,
         max_consecutive_losses: args.max_losses,
         pause_duration_minutes: args.pause_minutes,
         max_positions_per_direction: 10,
         no_trade_zone_pips: 100.0,
-    };
+        };
+
+        // Initialize Slack client early so optimizer can send updates
+        let slack = SlackClient::new(args.slack_enabled, args.slack_webhook.clone(), args.slack_channel.clone());
+
+        // Send immediate startup status to Slack
+        if slack.is_enabled() {
+            let startup_msg = format!("Engine STARTED | Symbol={} | Trading={} | LooseStart={} | LogLevel={}",
+                resolved_symbol,
+                if args.trade { "ENABLED" } else { "DISABLED" },
+                args.loose_start,
+                args.log_level);
+            match slack.send_status(&startup_msg) {
+                Ok(_) => info!("Startup notification sent to Slack"),
+                Err(e) => warn!("Failed to send startup Slack notification: {}", e),
+            }
+        }
+
+
+    // Ensure strategy log files exist so optimizer and logger can append safely
+    if !std::path::Path::new(&args.strategy_log_file).exists() {
+        match fs::write(&args.strategy_log_file, "[]") {
+            Ok(_) => info!("Created empty strategy log file: {}", args.strategy_log_file),
+            Err(e) => warn!("Failed to create strategy log file {}: {}", args.strategy_log_file, e),
+        }
+    }
+    if !std::path::Path::new(&args.live_log_file).exists() {
+        match fs::write(&args.live_log_file, "[]") {
+            Ok(_) => info!("Created empty live log file: {}", args.live_log_file),
+            Err(e) => warn!("Failed to create live log file {}: {}", args.live_log_file, e),
+        }
+    }
+
+                if args.auto_optimize {
+        let logs = load_trade_logs(&args.strategy_log_file);
+        let base = OptimizerConfig {
+            min_score: args.min_score,
+            min_confidence: args.min_confidence,
+            sideway_threshold: args.sideway_threshold,
+            min_trend_strength: args.min_trend_strength,
+            max_pullback_pips: args.max_pullback_pips,
+            max_fomo_pips: args.max_fomo_pips,
+            max_candle_mult: args.max_candle_mult,
+            sl_mult: args.sl_mult,
+            tp_mult: args.tp_mult,
+        };
+
+        // If user requested a loose start, apply loose config regardless of logs
+        if args.loose_start {
+                        let mut loose = base.clone();
+            loose.min_score = 1; // very low required score for demo
+            loose.min_confidence = 0.10; // very low confidence
+            loose.max_pullback_pips = (loose.max_pullback_pips + 25.0).min(120.0);
+            loose.max_fomo_pips = (loose.max_fomo_pips + 40.0).min(200.0);
+            loose.max_candle_mult = (loose.max_candle_mult + 2.0).min(6.0);
+
+
+            let mut metrics = HashMap::new();
+            metrics.insert("note".to_string(), 1.0);
+            let result = OptimizationResult { before: base.clone(), after: loose.clone(), metrics, rationale: vec!["Loose start forced by CLI".to_string()], updated_at: Utc::now().to_rfc3339() };
+
+            if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
+                warn!("Failed to save loose starter optimizer result: {}", e);
+            } else {
+                info!("Loose starter optimizer config saved to {}", args.optimizer_output_file);
+            }
+
+            // Apply loose config
+            config.min_score = loose.min_score;
+            config.min_confidence = loose.min_confidence;
+            config.sideway_ema_threshold = loose.sideway_threshold;
+            config.min_trend_strength = loose.min_trend_strength;
+            config.max_pullback_pips = loose.max_pullback_pips;
+            config.max_fomo_pips = loose.max_fomo_pips;
+            config.max_candle_mult = loose.max_candle_mult;
+            config.sl_mult = loose.sl_mult;
+            config.tp_mult = loose.tp_mult;
+
+                        info!("LOOSE STARTER FORCED: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
+                config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult);
+
+            // Notify Slack about applied loose optimizer (if enabled)
+            if slack.is_enabled() {
+                let summary = format!(
+                    "Loose starter applied at startup: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
+                    config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult
+                );
+                if let Err(e) = slack.send_optimizer_update("Loose Starter Applied", &summary) {
+                    warn!("Failed to send loose optimizer update to Slack: {}", e);
+                } else {
+                    info!("Loose optimizer update sent to Slack");
+                }
+            }
+        }
+
+
+        if logs.is_empty() && !args.loose_start {
+            // No historical logs: apply a loose starter config to create more trades initially
+            let mut loose = base.clone();
+            loose.min_score = 3;
+            loose.min_confidence = 0.30;
+            loose.max_pullback_pips = (loose.max_pullback_pips + 10.0).min(60.0);
+            loose.max_fomo_pips = (loose.max_fomo_pips + 15.0).min(80.0);
+            loose.max_candle_mult = (loose.max_candle_mult + 0.5).min(3.0);
+
+            let mut metrics = HashMap::new();
+            metrics.insert("note".to_string(), 1.0);
+            let result = OptimizationResult { before: base.clone(), after: loose.clone(), metrics, rationale: vec!["No logs - applying loose starter config".to_string()], updated_at: Utc::now().to_rfc3339() };
+
+            if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
+                warn!("Failed to save starter optimizer result: {}", e);
+            } else {
+                info!("Starter loose optimizer config saved to {}", args.optimizer_output_file);
+            }
+
+            // Apply loose config
+            config.min_score = loose.min_score;
+            config.min_confidence = loose.min_confidence;
+            config.sideway_ema_threshold = loose.sideway_threshold;
+            config.min_trend_strength = loose.min_trend_strength;
+            config.max_pullback_pips = loose.max_pullback_pips;
+            config.max_fomo_pips = loose.max_fomo_pips;
+            config.max_candle_mult = loose.max_candle_mult;
+            config.sl_mult = loose.sl_mult;
+            config.tp_mult = loose.tp_mult;
+
+                        info!("LOOSE STARTER APPLIED: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
+                config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult);
+
+            // Notify Slack about applied starter optimizer
+            if slack.is_enabled() {
+                let summary = format!(
+                    "Starter loose config applied: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
+                    config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult
+                );
+                if let Err(e) = slack.send_optimizer_update("Starter Loose Applied", &summary) {
+                    warn!("Failed to send starter optimizer update to Slack: {}", e);
+                } else {
+                    info!("Starter optimizer update sent to Slack");
+                }
+            }
+        } else if !args.loose_start {
+
+            let result = optimize_from_logs(&logs, &base);
+            if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
+                warn!("Failed to save optimization result: {}", e);
+            } else {
+                info!("Auto-optimization completed. Result saved to {}", args.optimizer_output_file);
+            }
+                        for line in &result.rationale {
+                            info!("OPTIMIZER: {}", line);
+                        }
+                        info!("OPTIMIZER METRICS: {:?}", result.metrics);
+
+
+
+            config.min_score = result.after.min_score;
+            config.min_confidence = result.after.min_confidence;
+            config.sideway_ema_threshold = result.after.sideway_threshold;
+            config.min_trend_strength = result.after.min_trend_strength;
+            config.max_pullback_pips = result.after.max_pullback_pips;
+            config.max_fomo_pips = result.after.max_fomo_pips;
+            config.max_candle_mult = result.after.max_candle_mult;
+            config.sl_mult = result.after.sl_mult;
+            config.tp_mult = result.after.tp_mult;
+
+            info!("OPTIMIZER APPLIED: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}",
+                config.min_score,
+                config.min_confidence,
+                config.sideway_ema_threshold,
+                config.min_trend_strength,
+                config.max_pullback_pips,
+                config.max_fomo_pips,
+                config.max_candle_mult,
+                config.sl_mult,
+                config.tp_mult
+            );
+
+            let summary = format!(
+                "Applied config: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}\nMetrics: {:?}\nRationale: {}",
+                config.min_score,
+                config.min_confidence,
+                config.sideway_ema_threshold,
+                config.min_trend_strength,
+                config.max_pullback_pips,
+                config.max_fomo_pips,
+                config.max_candle_mult,
+                config.sl_mult,
+                config.tp_mult,
+                result.metrics,
+                result.rationale.join(" | ")
+            );
+            if let Err(e) = slack.send_optimizer_update("Optimizer Applied", &summary) {
+                warn!("Failed to send optimizer update to Slack: {}", e);
+            } else {
+                info!("Optimizer update sent to Slack");
+            }
+        }
+    }
+
+
+
     
         // Initialize state
     let mut state = State::new();
@@ -308,10 +584,236 @@ fn main() {
     let mut candle_builder = CandleBuilder::new();
     let mut last_completed_candle: Option<Candle> = None;
     
-    // Price history
-    let mut price_history: VecDeque<f64> = VecDeque::with_capacity(100);
-    let mut high_history: VecDeque<f64> = VecDeque::with_capacity(100);
-    let mut low_history: VecDeque<f64> = VecDeque::with_capacity(100);
+        // Price history
+        let mut price_history: VecDeque<f64> = VecDeque::with_capacity(100);
+        let mut high_history: VecDeque<f64> = VecDeque::with_capacity(100);
+        let mut low_history: VecDeque<f64> = VecDeque::with_capacity(100);
+
+        // Warmup flag - will be set true after we finish warmup (history loaded or ticks collected)
+        let mut warmup_done: bool = false;
+
+        // Load historical candles either via MT5 Python bridge or from history file if available
+
+                // Track whether any historical candles were loaded
+        let mut history_loaded: bool = false;
+        // Whether we've sent the startup/warmup Slack notification
+        let mut startup_notified: bool = false;
+
+
+        if args.use_mt5_bridge {
+        // Use ZeroMQ DEALER to request HISTORY from python_bridge (ROUTER on order_addr)
+        let bridge_ctx = zmq::Context::new();
+        match bridge_ctx.socket(zmq::DEALER) {
+            Ok(sock) => {
+                if let Err(e) = sock.connect(&args.order_addr) {
+                    warn!("Failed to connect to python bridge at {}: {}", args.order_addr, e);
+                } else {
+                    // set receive timeout
+                    sock.set_rcvtimeo(5000).ok();
+                    let req = serde_json::json!({
+                        "type": "HISTORY",
+                        "data": { "symbol": args.mt5_symbol, "count": args.history_count }
+                    });
+                    let s = req.to_string();
+
+                    // Try repeatedly until we get a response or timeout
+                    let start = Instant::now();
+                    let mut history_resp: Option<String> = None;
+                    while start.elapsed().as_secs() < args.history_wait_sec {
+                        debug!("HISTORY request (elapsed {}s)", start.elapsed().as_secs());
+                        match sock.send(s.as_bytes(), 0) {
+                            Ok(_) => {
+                                debug!("Sent HISTORY request to bridge: {}", s);
+                                match sock.recv_string(0) {
+                                    Ok(Ok(resp)) => {
+                                        debug!("Bridge raw response: {}", resp);
+                                        history_resp = Some(resp);
+                                        break;
+                                    }
+                                    Ok(Err(_)) => warn!("Non-UTF8 response from bridge"),
+                                    Err(e) => debug!("No reply from python bridge yet: {:?}", e),
+                                }
+                            }
+                            Err(e) => debug!("Failed to send HISTORY request to bridge: {}", e),
+                        }
+                        thread::sleep(Duration::from_millis(500));
+                    }
+
+                    if let Some(resp) = history_resp {
+                        // Try parse as list of candles or wrapper
+                        if let Ok(mut v) = serde_json::from_str::<Vec<Candle>>(&resp) {
+
+                            if v.len() > args.history_count { v.drain(0..v.len()-args.history_count); }
+                            if !v.is_empty() {
+                                info!("Loaded {} historical candles from python_bridge for {}", v.len(), args.mt5_symbol);
+                                history_loaded = true;
+                                for c in &v {
+                                    state.push_candle(*c);
+                                    price_history.push_back(c.close);
+                                    high_history.push_back(c.high);
+                                    low_history.push_back(c.low);
+                                }
+                                const MAX_HISTORY: usize = 100;
+                                while price_history.len() > MAX_HISTORY { price_history.pop_front(); }
+                                while high_history.len() > MAX_HISTORY { high_history.pop_front(); }
+                                while low_history.len() > MAX_HISTORY { low_history.pop_front(); }
+                                last_completed_candle = v.last().cloned();
+                                // If we loaded enough history, mark warmup done
+                                                                if price_history.len() >= 100 {
+                                    warmup_done = true;
+                                    info!("✅ WARMUP COMPLETE (from history): {} ticks collected, indicators ready", price_history.len());
+                                    if let (Some(f), Some(s)) = (state.ema_fast, state.ema_slow) {
+                                        info!("INDICATORS: EMA_fast={:.3} EMA_slow={:.3}", f, s);
+                                    }
+                                    if let Some(r) = state.rsi { info!("INDICATORS: RSI={:.2}", r); }
+                                    if let Some(a) = state.atr { info!("INDICATORS: ATR={:.4}", a); }
+
+                                    // Send Slack startup/warmup notification once
+                                    if slack.is_enabled() && !startup_notified {
+                                        let msg = format!("Engine READY (from history): {} ticks collected", price_history.len());
+                                        match slack.send_status(&msg) {
+                                            Ok(_) => info!("Startup notification sent to Slack"),
+                                            Err(e) => warn!("Failed to send startup Slack notification: {}", e),
+                                        }
+                                        startup_notified = true;
+                                    }
+                                }
+
+                            }
+
+                        } else if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(&resp) {
+                            if let Some(arr) = wrapper.get("data").and_then(|d| d.as_array()) {
+                                let mut v: Vec<Candle> = Vec::new();
+                                for it in arr {
+                                    let time = it.get("time").and_then(|x| x.as_i64()).unwrap_or(0);
+                                    let open = it.get("open").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let high = it.get("high").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let low = it.get("low").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let close = it.get("close").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                                    let volume = it.get("volume").and_then(|x| x.as_i64()).unwrap_or(0);
+                                    v.push(Candle { time, open, high, low, close, volume });
+                                }
+                                if v.len() > args.history_count { v.drain(0..v.len()-args.history_count); }
+                                if !v.is_empty() {
+                                    info!("Loaded {} historical candles from python_bridge (wrapper) for {}", v.len(), args.mt5_symbol);
+                                    history_loaded = true;
+                                    for c in &v {
+                                        state.push_candle(*c);
+                                        price_history.push_back(c.close);
+                                        high_history.push_back(c.high);
+                                        low_history.push_back(c.low);
+                                    }
+                                    const MAX_HISTORY: usize = 100;
+                                    while price_history.len() > MAX_HISTORY { price_history.pop_front(); }
+                                    while high_history.len() > MAX_HISTORY { high_history.pop_front(); }
+                                    while low_history.len() > MAX_HISTORY { low_history.pop_front(); }
+                                    last_completed_candle = v.last().cloned();
+                                    if price_history.len() >= 100 {
+                                        warmup_done = true;
+                                        info!("✅ WARMUP COMPLETE (from history): {} ticks collected, indicators ready", price_history.len());
+                                        if let (Some(f), Some(s)) = (state.ema_fast, state.ema_slow) {
+                                            info!("INDICATORS: EMA_fast={:.3} EMA_slow={:.3}", f, s);
+                                        }
+                                        if let Some(r) = state.rsi { info!("INDICATORS: RSI={:.2}", r); }
+                                        if let Some(a) = state.atr { info!("INDICATORS: ATR={:.4}", a); }
+
+                                        // Send Slack startup/warmup notification once
+                                        if slack.is_enabled() && !startup_notified {
+                                            let msg = format!("Engine READY (from history): {} ticks collected", price_history.len());
+                                            match slack.send_status(&msg) {
+                                                Ok(_) => info!("Startup notification sent to Slack"),
+                                                Err(e) => warn!("Failed to send startup Slack notification: {}", e),
+                                            }
+                                            startup_notified = true;
+                                        }
+                                    }
+
+                                }
+                            }
+                        } else {
+                            warn!("Unexpected HISTORY response from bridge: {}", resp);
+                            // save raw response for debugging
+                            if let Err(e) = fs::write("bridge_history_resp.json", resp.as_bytes()) {
+                                warn!("Failed to save bridge response file: {}", e);
+                            } else {
+                                warn!("Saved bridge raw response to bridge_history_resp.json for debugging");
+                            }
+                        }
+                    } else {
+                        warn!("Did not receive history from bridge within {}s", args.history_wait_sec);
+                    }
+                }
+                // socket will close when dropped
+            }
+
+            Err(e) => warn!("Failed to create ZMQ DEALER socket for bridge: {}", e),
+        }
+    } else if !args.history_file.is_empty() && std::path::Path::new(&args.history_file).exists() {
+
+        match std::fs::read_to_string(&args.history_file) {
+            Ok(s) => {
+                if !s.trim().is_empty() {
+                    match serde_json::from_str::<Vec<Candle>>(&s) {
+                        Ok(mut v) => {
+                            // keep only the most recent history_count candles
+                            if v.len() > args.history_count {
+                                v.drain(0..v.len()-args.history_count);
+                            }
+                            if !v.is_empty() {
+                                info!("Loaded {} historical candles from {}", v.len(), args.history_file);
+                                history_loaded = true;
+                                for c in &v {
+                                    state.push_candle(*c);
+                                    price_history.push_back(c.close);
+                                    high_history.push_back(c.high);
+                                    low_history.push_back(c.low);
+                                }
+                                // Trim to runtime MAX_HISTORY
+                                const MAX_HISTORY: usize = 100;
+                                while price_history.len() > MAX_HISTORY { price_history.pop_front(); }
+                                while high_history.len() > MAX_HISTORY { high_history.pop_front(); }
+                                while low_history.len() > MAX_HISTORY { low_history.pop_front(); }
+
+                                last_completed_candle = v.last().cloned();
+                                                                if price_history.len() >= 100 {
+                                    warmup_done = true;
+                                    info!("✅ WARMUP COMPLETE (from history): {} ticks collected, indicators ready", price_history.len());
+                                    if let (Some(f), Some(s)) = (state.ema_fast, state.ema_slow) {
+                                        info!("INDICATORS: EMA_fast={:.3} EMA_slow={:.3}", f, s);
+                                    }
+                                    if let Some(r) = state.rsi { info!("INDICATORS: RSI={:.2}", r); }
+                                    if let Some(a) = state.atr { info!("INDICATORS: ATR={:.4}", a); }
+
+                                    // Send Slack startup/warmup notification once
+                                    if slack.is_enabled() && !startup_notified {
+                                        let msg = format!("Engine READY (from history): {} ticks collected", price_history.len());
+                                        match slack.send_status(&msg) {
+                                            Ok(_) => info!("Startup notification sent to Slack"),
+                                            Err(e) => warn!("Failed to send startup Slack notification: {}", e),
+                                        }
+                                        startup_notified = true;
+                                    }
+                                }
+
+                            }
+
+                        }
+                        Err(e) => warn!("Failed to parse history file {}: {}", args.history_file, e),
+                    }
+                }
+            }
+            Err(e) => warn!("Failed to read history file {}: {}", args.history_file, e),
+        }
+    }
+
+    // If user requested history to be required, exit if we couldn't load any
+    if args.require_history && !history_loaded {
+        error!("History required at startup but none was loaded. Exiting.");
+        std::process::exit(1);
+    }
+
+    
+
     
         // Cooldown tracking
         let mut last_action_time: Option<DateTime<Utc>> = None;
@@ -339,21 +841,7 @@ fn main() {
         None
     };
     
-        // Slack client initialization
-    let slack = SlackClient::new(args.slack_enabled, args.slack_webhook.clone(), args.slack_channel.clone());
-    if slack.is_enabled() {
-        if slack.is_configured() {
-            info!("✅ Slack ENABLED - Channel: {} | Webhook: configured", slack.get_channel());
-            match slack.send_status("GOLD Scalping Bot v2.0 started") {
-                Ok(_) => info!("✅ Slack test message sent successfully"),
-                Err(e) => warn!("⚠️ Slack test message failed: {}", e),
-            }
-        } else {
-            warn!("⚠️ Slack ENABLED but no webhook URL configured - messages will be skipped");
-        }
-    } else {
-        info!("⏸️ Slack notifications DISABLED");
-    }
+        
     
     // ZMQ subscriber for position close notifications (from order_monitor.py)
     let notify_socket = if args.slack_notify_port > 0 {
@@ -370,9 +858,12 @@ fn main() {
         None
     };
     
-    info!("Starting main trading loop...");
+        info!("Starting main trading loop...");
+
     
+
     loop {
+
         match sub.recv_string(0) {
             Ok(Ok(msg)) => {
                 if args.verbose { debug!("RAW: {}", msg); }
@@ -452,22 +943,86 @@ fn main() {
                 let highs_vec: Vec<f64> = high_history.iter().copied().collect();
                 let lows_vec: Vec<f64> = low_history.iter().copied().collect();
                 
-                state.ema_fast = calc_ema(&prices_vec, config.ema_fast);
+                                state.ema_fast = calc_ema(&prices_vec, config.ema_fast);
                 state.ema_slow = calc_ema(&prices_vec, config.ema_slow);
                 state.rsi_prev = state.rsi;
                 state.rsi = calc_rsi(&closes_vec, config.rsi_period);
                 state.atr = calc_atr(&highs_vec, &lows_vec, &closes_vec, config.atr_period);
-                
-                                if price_history.len() < 60 {
-                    info!("🔄 WARMUP: {}/{} ticks collected (need {} for indicators)", 
-                        price_history.len(), 60, 60);
-                    continue;
-                } else if price_history.len() == 60 {
-                    info!("✅ WARMUP COMPLETE: {} ticks collected, indicators ready", price_history.len());
+
+                // Short per-tick log (visible when --per-tick-log)
+                if args.per_tick_log {
+                    let ema_fast = state.ema_fast.unwrap_or(0.0);
+                    let ema_slow = state.ema_slow.unwrap_or(0.0);
+                    let ema_diff = (ema_fast - ema_slow).abs();
+                    let rsi_val = state.rsi.unwrap_or(0.0);
+                    let atr_val = state.atr.unwrap_or(0.0);
+                    info!("TICK | P={:.3} ΔEMA={:.3} RSI={:.1} ATR={:.3} Ticks={}", price, ema_diff, rsi_val, atr_val, state.ticks_processed);
                 }
+
+                                // Optional per-tick analysis logging
+                if args.per_tick_log {
+                    let ema_fast = state.ema_fast.unwrap_or(0.0);
+                    let ema_slow = state.ema_slow.unwrap_or(0.0);
+                    let rsi_val = state.rsi.unwrap_or(0.0);
+                    let atr_val = state.atr.unwrap_or(0.0);
+                    let ema_diff = (ema_fast - ema_slow).abs();
+                    let structure = detect_structure(&highs_vec, &lows_vec, 20);
+                    // Use INFO level for per-tick logs to ensure visibility when requested
+                    debug!("TICK ANALYSIS | Price={:.3} EMA_fast={:.3} EMA_slow={:.3} EMA_diff={:.3} RSI={:.2} ATR={:.4} Struct={:?} Ticks={}",
+                        price, ema_fast, ema_slow, ema_diff, rsi_val, atr_val, structure, state.ticks_processed);
+                }
+
+
+                if !warmup_done && price_history.len() < 100 {
+                    info!("🔄 WARMUP: {}/{} ticks collected (need {} for indicators)", price_history.len(), 100, 100);
+                    continue;
+                }
+                if !warmup_done && price_history.len() >= 100 {
+                    warmup_done = true;
+                    info!("✅ WARMUP COMPLETE: {} ticks collected, indicators ready", price_history.len());
+                    if let (Some(f), Some(s)) = (state.ema_fast, state.ema_slow) {
+                        info!("INDICATORS: EMA_fast={:.3} EMA_slow={:.3}", f, s);
+                    }
+                    if let Some(r) = state.rsi { info!("INDICATORS: RSI={:.2}", r); }
+                    if let Some(a) = state.atr { info!("INDICATORS: ATR={:.4}", a); }
+                }
+
+
+
                 
+                                if args.auto_reload_optimized_config {
+                                    let now = Utc::now();
+                                    if last_heartbeat_time.map_or(true, |t| (now - t).num_seconds() >= args.optimizer_reload_sec as i64) {
+                                        if let Some(result) = load_optimization_result(&args.optimizer_output_file) {
+                                            config.min_score = result.after.min_score;
+                                            config.min_confidence = result.after.min_confidence;
+                                            config.sideway_ema_threshold = result.after.sideway_threshold;
+                                            config.min_trend_strength = result.after.min_trend_strength;
+                                            config.max_pullback_pips = result.after.max_pullback_pips;
+                                            config.max_fomo_pips = result.after.max_fomo_pips;
+                                            config.max_candle_mult = result.after.max_candle_mult;
+                                            config.sl_mult = result.after.sl_mult;
+                                            config.tp_mult = result.after.tp_mult;
+                                            info!("CONFIG RELOADED FROM OPTIMIZER: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}",
+                                                config.min_score,
+                                                config.min_confidence,
+                                                config.sideway_ema_threshold,
+                                                config.min_trend_strength,
+                                                config.max_pullback_pips,
+                                                config.max_fomo_pips,
+                                                config.max_candle_mult,
+                                                config.sl_mult,
+                                                config.tp_mult);
+                                        }
+                                        last_heartbeat_time = Some(now);
+                                    }
+                                }
+
+
+
                                 // RUN STRATEGY
-                let signal = should_trade(&mut state, price, bid, ask, &current_candle, &config);
+                                let signal = should_trade(&mut state, price, bid, ask, &current_candle, &config);
+
                 
                 // Always log signal status
                 let ema_str = match (state.ema_fast, state.ema_slow) {
@@ -538,12 +1093,33 @@ fn main() {
                         }
                     }
                                         SignalAction::SkipDueToFilter => { 
-                        if args.verbose { 
-                            info!("⬜ SKIP | {}", signal.reason); 
-                        }
-                    }
+                                            if args.verbose { 
+                                                info!("⬜ SKIP | {}", signal.reason); 
+                                            }
+                                            let highs_vec: Vec<f64> = state.highs.iter().copied().collect();
+                                            let lows_vec: Vec<f64> = state.lows.iter().copied().collect();
+                                            let log_row = make_strategy_row(
+                                                &resolved_symbol,
+                                                "NONE",
+                                                price,
+                                                signal.score,
+                                                signal.confidence,
+                                                state.ema_fast.unwrap_or(0.0),
+                                                state.ema_slow.unwrap_or(0.0),
+                                                state.rsi.unwrap_or(0.0),
+                                                state.atr.unwrap_or(0.0),
+                                                &format!("{:?}", detect_structure(&highs_vec, &lows_vec, 20)),
+                                                0,
+                                                0,
+                                                &signal.reason,
+                                                "SKIP",
+                                                None,
+                                            );
+                                            let _ = append_strategy_log(&args.live_log_file, &log_row);
+                                        }
+
                     SignalAction::Hold => { 
-                        // Log status every 30 seconds to show engine is alive
+                                                // Log status every 30 seconds to show engine is alive
                         let now = Utc::now();
                         if last_status_time.map_or(true, |t| (now - t).num_seconds() >= 30) {
                             let trend_status = if state.ema_fast.is_some() && state.ema_slow.is_some() {
@@ -622,8 +1198,29 @@ fn main() {
                                                                                                                                             info!("   ⚠️ WARNING: Market is SIDEWAY or weak trend - filters active");
                                                                                                                                         }
                             
+                                                                // Prepare Slack status text (include candle status)
+                                                                let candle_info = if let Some(c) = last_completed_candle {
+                                                                    format!("LastCandle: t={} O={:.2} H={:.2} L={:.2} C={:.2} V={}", c.time, c.open, c.high, c.low, c.close, c.volume)
+                                                                } else {
+                                                                    format!("CurrentCandle: t={} O={:.2} H={:.2} L={:.2} C={:.2} V={}", current_candle.time, current_candle.open, current_candle.high, current_candle.low, current_candle.close, current_candle.volume)
+                                                                };
+
+                                                                let status_msg = format!(
+                                                                    "Price={:.2} | {} | EMA20/50={} | {} | Ticks={} | {}",
+                                                                    price, trend_status, ema_str, rsi_str, state.ticks_processed, candle_info
+                                                                );
+
+                                                                if slack.is_enabled() {
+                                                                    if let Err(e) = slack.send_status(&status_msg) {
+                                                                        warn!("⚠️ Slack status failed: {}", e);
+                                                                    } else {
+                                                                        debug!("Slack status sent");
+                                                                    }
+                                                                }
+
                                                                 last_status_time = Some(now);
                         }
+
                     }
                 }
                 
@@ -729,35 +1326,67 @@ fn main() {
                                                             }
                                                         });
                             
-                            let s = payload.to_string();
+                                                        let s = payload.to_string();
                             info!("📤 EXECUTING {} {} lots @ {} | SL={:.2} TP={:.2}",
                                 order_type, args.volume, signal.entry_price, signal.stop_loss, signal.take_profit);
-                            
+
+                            // Notify Slack about order request
+                            if slack.is_enabled() {
+                                let sl_opt = if signal.stop_loss > 0.0 { Some(signal.stop_loss) } else { None };
+                                let tp_opt = if signal.take_profit > 0.0 { Some(signal.take_profit) } else { None };
+                                if let Err(e) = slack.send_order_request(order_type, args.volume, signal.entry_price, sl_opt, tp_opt, &request_id) {
+                                    warn!("Failed to send order request notification to Slack: {}", e);
+                                }
+                            }
+
                                                         match sock.send(s.as_bytes(), 0) {
+
                                 Ok(_) => match sock.recv_string(0) {
                                     Ok(Ok(resp)) => {
-                                        info!("📥 Order response: {}", resp);
-                                        state.record_trade(signal.entry_price, true);
-                                        if signal.direction == Direction::Long { state.long_positions += 1; }
-                                        else if signal.direction == Direction::Short { state.short_positions += 1; }
+                                                        info!("📥 Order response: {}", resp);
+                                                        state.record_trade(signal.entry_price, true);
+                                                        if signal.direction == Direction::Long { state.long_positions += 1; }
+                                                        else if signal.direction == Direction::Short { state.short_positions += 1; }
+
+                                                        let highs_vec: Vec<f64> = state.highs.iter().copied().collect();
+                                                        let lows_vec: Vec<f64> = state.lows.iter().copied().collect();
+                                                        let log_row = make_strategy_row(
+                                                            &resolved_symbol,
+                                                            order_type,
+                                                            signal.entry_price,
+                                                            signal.score,
+                                                            signal.confidence,
+                                                            state.ema_fast.unwrap_or(0.0),
+                                                            state.ema_slow.unwrap_or(0.0),
+                                                            state.rsi.unwrap_or(0.0),
+                                                            state.atr.unwrap_or(0.0),
+                                                            &format!("{:?}", detect_structure(&highs_vec, &lows_vec, 20)),
+                                                            0,
+                                                            0,
+                                                            &signal.reason,
+                                                            "ENTER",
+                                                            None,
+                                                        );
+                                                        let _ = append_strategy_log(&args.live_log_file, &log_row);
                                         
-                                        // Send Slack notification for executed order
-                                        if let Err(e) = slack.send_order_executed(
-                                            order_type,
-                                            args.volume,
-                                            signal.entry_price,
-                                            &request_id
-                                        ) {
-                                            warn!("⚠️ Slack order notification failed: {}", e);
-                                        }
-                                    }
+                                                        // Send Slack notification for executed order
+                                                        if let Err(e) = slack.send_order_executed(
+                                                            order_type,
+                                                            args.volume,
+                                                            signal.entry_price,
+                                                            &request_id
+                                                        ) {
+                                                            warn!("⚠️ Slack order notification failed: {}", e);
+                                                        }
+                                                    }
+
                                     Ok(Err(_)) => { warn!("⚠️ Non-UTF8 reply"); }
                                     Err(e) => { warn!("⚠️ No reply: {:?}", e); }
                                 },
                                 Err(e) => { error!("❌ Send failed: {:?}", e); }
                             }
                         }
-                    } else {
+                                        } else {
                         info!("📋 SIGNAL {} (trade disabled) | entry={:.2} SL={:.2} TP={:.2} | score={} conf={:.2}",
                             match signal.direction {
                                 Direction::Long => "BUY",
@@ -765,7 +1394,33 @@ fn main() {
                                 Direction::None => "HOLD",
                             },
                             signal.entry_price, signal.stop_loss, signal.take_profit, signal.score, signal.confidence);
+
+                        let highs_vec: Vec<f64> = state.highs.iter().copied().collect();
+                        let lows_vec: Vec<f64> = state.lows.iter().copied().collect();
+                        let log_row = make_strategy_row(
+                            &resolved_symbol,
+                            match signal.direction {
+                                Direction::Long => "BUY",
+                                Direction::Short => "SELL",
+                                Direction::None => "HOLD",
+                            },
+                            signal.entry_price,
+                            signal.score,
+                            signal.confidence,
+                            state.ema_fast.unwrap_or(0.0),
+                            state.ema_slow.unwrap_or(0.0),
+                            state.rsi.unwrap_or(0.0),
+                            state.atr.unwrap_or(0.0),
+                            &format!("{:?}", detect_structure(&highs_vec, &lows_vec, 20)),
+                            0,
+                            0,
+                            &signal.reason,
+                            "ENTER",
+                            None,
+                        );
+                        let _ = append_strategy_log(&args.live_log_file, &log_row);
                     }
+
                     
                     last_action_time = Some(now);
                 }
@@ -781,7 +1436,7 @@ fn main() {
             match notify_sock.recv_string(zmq::DONTWAIT) {
                 Ok(Ok(msg)) => {
                     // Message format: "CLOSE_NOTIFY|{ticket}|{direction}|{volume}|{price}|{profit}|{magic}"
-                    let parts: Vec<&str> = msg.split('|').collect();
+                                        let parts: Vec<&str> = msg.split('|').collect();
                     if parts.len() >= 7 && parts[0] == "CLOSE_NOTIFY" {
                         let ticket = parts[1];
                         let direction = parts[2];
@@ -791,12 +1446,90 @@ fn main() {
                         let magic: i32 = parts[6].parse().unwrap_or(0);
                         
                         info!("Position CLOSED: #{ticket} {direction} {volume} lots @ {price} | P&L: ${profit:+.2} | Magic: {magic}");
+
+                        let highs_vec: Vec<f64> = state.highs.iter().copied().collect();
+                        let lows_vec: Vec<f64> = state.lows.iter().copied().collect();
+                        let log_row = make_strategy_row(
+                            &resolved_symbol,
+                            direction,
+                            price,
+                            0,
+                            0.0,
+                            state.ema_fast.unwrap_or(0.0),
+                            state.ema_slow.unwrap_or(0.0),
+                            state.rsi.unwrap_or(0.0),
+                            state.atr.unwrap_or(0.0),
+                            &format!("{:?}", detect_structure(&highs_vec, &lows_vec, 20)),
+                            0,
+                            0,
+                            &format!("close ticket={} magic={}", ticket, magic),
+                            "CLOSE",
+                            Some(profit),
+                        );
+                                                let _ = append_strategy_log(&args.live_log_file, &log_row);
                         
                         // Send Slack notification
                         if let Err(e) = slack.send_position_closed(ticket, direction, volume, price, profit, magic) {
                             warn!("Slack close notification failed: {}", e);
                         }
+
+                        // If auto-optimization enabled, run a quick incremental optimizer after each close
+                        if args.auto_optimize {
+                            let logs = load_trade_logs(&args.strategy_log_file);
+                            let base_opt = if let Some(res) = load_optimization_result(&args.optimizer_output_file) {
+                                res.after
+                            } else {
+                                OptimizerConfig {
+                                    min_score: args.min_score,
+                                    min_confidence: args.min_confidence,
+                                    sideway_threshold: args.sideway_threshold,
+                                    min_trend_strength: args.min_trend_strength,
+                                    max_pullback_pips: args.max_pullback_pips,
+                                    max_fomo_pips: args.max_fomo_pips,
+                                    max_candle_mult: args.max_candle_mult,
+                                    sl_mult: args.sl_mult,
+                                    tp_mult: args.tp_mult,
+                                }
+                            };
+
+                            // Run optimizer (lightweight) and apply result
+                            let result = optimize_from_logs(&logs, &base_opt);
+                                                        if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
+                                warn!("Failed to save incremental optimization result: {}", e);
+                            } else {
+                                info!("Incremental optimizer saved to {}", args.optimizer_output_file);
+                                // Notify Slack about incremental optimizer
+                                if slack.is_enabled() {
+                                    let summary = format!(
+                                        "Incremental optimizer applied: min_score={} min_conf={:.2} pullback={} fomo={}",
+                                        result.after.min_score, result.after.min_confidence, result.after.max_pullback_pips, result.after.max_fomo_pips
+                                    );
+                                    if let Err(e) = slack.send_optimizer_update("Incremental Optimizer Applied", &summary) {
+                                        warn!("Failed to send incremental optimizer update to Slack: {}", e);
+                                    } else {
+                                        info!("Incremental optimizer update sent to Slack");
+                                    }
+                                }
+                            }
+
+                            // Apply new config gradually
+
+                            config.min_score = result.after.min_score;
+                            config.min_confidence = result.after.min_confidence;
+                            config.sideway_ema_threshold = result.after.sideway_threshold;
+                            config.min_trend_strength = result.after.min_trend_strength;
+                            config.max_pullback_pips = result.after.max_pullback_pips;
+                            config.max_fomo_pips = result.after.max_fomo_pips;
+                            config.max_candle_mult = result.after.max_candle_mult;
+                            config.sl_mult = result.after.sl_mult;
+                            config.tp_mult = result.after.tp_mult;
+
+                            info!("INCREMENTAL OPTIMIZER APPLIED: min_score={} min_conf={:.2} pullback={:.1} fomo={:.1}",
+                                config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips);
+                        }
                     }
+
+
                 }
                 _ => { /* No message or error - normal */ }
             }

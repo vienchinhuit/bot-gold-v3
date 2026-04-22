@@ -180,6 +180,32 @@ class OrderWorker:
                 return self._handle_position_close_batch(data)
             elif msg_type == MessageType.POSITION_MODIFY.value:
                 return self._handle_position_modify(data)
+            # HISTORY request: return array of OHLC candles
+            elif msg_type == MessageType.HISTORY.value or msg_type == "HISTORY":
+                # data expected: { "symbol": "GOLD", "count": 500 }
+                symbol = None
+                count = 500
+                try:
+                    if isinstance(data, dict):
+                        symbol = data.get('symbol')
+                        count = int(data.get('count', 500))
+                except Exception:
+                    pass
+
+                if not symbol and hasattr(self.mt5, 'symbols') and self.mt5.symbols:
+                    symbol = self.mt5.symbols[0]
+                if not symbol:
+                    symbol = 'GOLD'
+
+                self._order_logger.info(f"Processing HISTORY request: symbol={symbol} count={count}")
+                candles = []
+                try:
+                    candles = self.mt5.get_ohlc(symbol, count=count)
+                except Exception as e:
+                    self._order_logger.error(f"HISTORY error: {e}")
+                # Return JSON array of candles (may be empty)
+                return json.dumps(candles)
+
             elif msg_type == MessageType.ORDER_INFO.value:
                 return self._handle_order_info(data)
             else:

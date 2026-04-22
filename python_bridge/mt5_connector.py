@@ -109,6 +109,59 @@ class MT5Connector:
                 ticks[symbol] = tick
         
         return ticks
+
+    def get_ohlc(self, symbol: str, timeframe=mt5.TIMEFRAME_M1, count: int = 500) -> List[Dict[str, Any]]:
+        """Return recent OHLC candles for a symbol as a list of dicts.
+
+        Each returned dict contains: time (epoch seconds), open, high, low, close, volume
+        """
+        try:
+            # copy_rates_from returns an array-like of rates; use datetime.now() as to_time
+            rates = mt5.copy_rates_from(symbol, timeframe, datetime.now(), count)
+            if rates is None:
+                self._system_logger.warning(f"get_ohlc: no rates for {symbol}")
+                return []
+
+            res: List[Dict[str, Any]] = []
+            for r in rates:
+                # r is a numpy.void / record with fields; access by key/index
+                try:
+                    t = int(r['time'])
+                except Exception:
+                    # fallback if field access fails
+                    t = int(getattr(r, 'time', 0) or 0)
+                try:
+                    open_p = float(r['open'])
+                    high_p = float(r['high'])
+                    low_p = float(r['low'])
+                    close_p = float(r['close'])
+                except Exception:
+                    open_p = float(getattr(r, 'open', 0.0) or 0.0)
+                    high_p = float(getattr(r, 'high', 0.0) or 0.0)
+                    low_p = float(getattr(r, 'low', 0.0) or 0.0)
+                    close_p = float(getattr(r, 'close', 0.0) or 0.0)
+                # volume fields differ by platform/MT5: try common names
+                vol = 0
+                try:
+                    vol = int(r['tick_volume'])
+                except Exception:
+                    try:
+                        vol = int(r['real_volume'])
+                    except Exception:
+                        vol = int(getattr(r, 'tick_volume', 0) or getattr(r, 'real_volume', 0) or 0)
+
+                res.append({
+                    'time': t,
+                    'open': open_p,
+                    'high': high_p,
+                    'low': low_p,
+                    'close': close_p,
+                    'volume': vol
+                })
+            return res
+        except Exception as e:
+            self._system_logger.error(f"get_ohlc error for {symbol}: {e}")
+            return []
     
     def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get symbol information."""

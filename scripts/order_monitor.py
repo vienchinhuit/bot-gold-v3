@@ -1,4 +1,10 @@
-"""Order Monitor: Theo dõi và đóng lệnh theo từng position."""
+"""Order Monitor: Theo doi va dong lenh theo tung position.
+
+NEU mot position bien mat khoi danh sach (khong phai do dong tay),
+co the MT5 da tu dong do TP/SL - se gui notification cho Slack.
+
+Fix: Phat hien positions bien mat va gui Slack notification
+"""
 
 import zmq
 import json
@@ -6,18 +12,24 @@ import time
 import threading
 import os
 from collections import defaultdict
+from datetime import datetime
 
-# Cấu hình
+try:
+    import MetaTrader5 as mt5
+except Exception:
+    mt5 = None
+
+# Cau hinh
 SYMBOL = "GOLD"
 PORT = 5556
-CHECK_INTERVAL = 0.2  # Giây
+CHECK_INTERVAL = 0.2  # Gian
 
 # Slack notification settings (ZMQ PUB)
-SLACK_NOTIFY_PORT = 5557  # Port để gửi close notifications đến Rust engine (0 = disable)
+SLACK_NOTIFY_PORT = 5557  # Port de gui close notifications den Rust engine (0 = disable)
 
 
 class SlackNotifier:
-    """"Gửi notification qua ZMQ đến Rust engine để forward qua Slack."""
+    """"Gui notification qua ZMQ den Rust engine de forward qua Slack."""
     
     def __init__(self, port=5557):
         self.port = port
@@ -37,15 +49,26 @@ class SlackNotifier:
                 print(f"Slack notifier: Failed to bind port {port}: {e}")
                 self.socket = None
     
-    def send_close_notify(self, ticket, direction, volume, price, profit, magic):
-        """Gửi notification khi position được đóng."""
+    def send_close_notify(self, ticket, direction, volume, price, profit, magic, reason="MANUAL"):
+        """Gui notification khi position duoc dong.
+        
+        Args:
+            ticket: Position ticket
+            direction: BUY/SELL
+            volume: Lot size
+            price: Open price
+            profit: Realized P&L
+            magic: Magic number
+            reason: CLOSE_REASON - MANUAL, TP, SL, BATCH
+        """
         if not self.socket:
             return
         try:
-            # Format: CLOSE_NOTIFY|ticket|direction|volume|price|profit|magic
-            msg = f"CLOSE_NOTIFY|{ticket}|{direction}|{volume}|{price}|{profit}|{magic}"
+            # Format: CLOSE_NOTIFY|ticket|direction|volume|price|profit|magic|reason
+            msg = f"CLOSE_NOTIFY|{ticket}|{direction}|{volume}|{price}|{profit}|{magic}|{reason}"
             self.socket.send_string(msg)
-            print(f"  [SLACK] Notified: #{ticket} {direction} {volume} lots @ {price} P&L: ${profit:+.2f}")
+            reason_label = "TP" if reason == "TP" else ("SL" if reason == "SL" else ("BATCH" if reason == "BATCH" else "CLOSE"))
+            print(f"  [SLACK] Notified #{ticket} {direction} {volume} lots @{price} P&L=${profit:+.2f} [{reason_label}]")
         except Exception as e:
             print(f"  [SLACK] Failed to send: {e}")
     
@@ -56,10 +79,8 @@ class SlackNotifier:
             self.context.term()
 
 
-def get_all_positions(client, symbol=None):
-        pass
-STOP_LOSS = 0  # Đặt >0 để tự đóng khi lỗ (VD: 10 = đóng khi lỗ $10), đặt 0 để tắt
-BATCH_PROFIT_TARGET = 1000.0  # Tổng PNL đạt target này sẽ đóng toàn bộ batch (đặt 0 để tắt)
+STOP_LOSS = 0  # Dat >0 de tu dong khi lo (VD: 10 = dong khi lo $10), dat 0 de tat
+BATCH_PROFIT_TARGET = 1000.0  # Tong PNL dat target nay se dong toan bo batch (dat 0 de tat)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BATCH_INFO_FILE = os.path.join(SCRIPT_DIR, "batch_info.json")
 
@@ -121,22 +142,84 @@ def close_position(client, ticket):
     client.send("POSITION_CLOSE", {"ticket": ticket, "volume": 0})
     return client.get_response(timeout=10)
 
-def get_position_profit(client, ticket) -> float:
-    """Query MT5 for the realized profit of a closed position.
-    Returns 0.0 if the request fails.
+
+def normalize_position_snapshot(p):
+    return {
+        'ticket': p.get('ticket'),
+        'symbol': p.get('symbol'),
+        'type': p.get('type', 'UNKNOWN'),
+        'volume': p.get('volume', 0),
+        'price_open': p.get('price_open', 0),
+        'profit': p.get('profit', 0),
+        'magic': p.get('magic', 0),
+        'comment': p.get('comment', ''),
+        'stop_loss': p.get('stop_loss', 0),
+        'take_profit': p.get('take_profit', 0),
+        'time': p.get('time'),
+    }
+
+
+def map_reason_from_deal_reason(deal_reason):
+    if mt5 is None:
+        return "UNKNOWN"
+
+    reason_map = {
+        getattr(mt5, "DEAL_REASON_SL", None): "SL",
+        getattr(mt5, "DEAL_REASON_TP", None): "TP",
+        getattr(mt5, "DEAL_REASON_CLIENT", None): "MANUAL",
+        getattr(mt5, "DEAL_REASON_EXPERT", None): "MANUAL",
+        getattr(mt5, "DEAL_REASON_MOBILE", None): "MANUAL",
+        getattr(mt5, "DEAL_REASON_WEB", None): "MANUAL",
+        getattr(mt5, "DEAL_REASON_SO", None): "SL",
+    }
+    return reason_map.get(deal_reason, "UNKNOWN")
+
+
+def get_position_history_reason(ticket):
+    if mt5 is None:
+        return None
+
+    try:
+        end_time = time.time() + 60
+        start_time = end_time - 7 * 24 * 3600
+        deals = mt5.history_deals_get(start_time, end_time)
+        if not deals:
+            return None
+
+        matched = [d for d in deals if getattr(d, "position_id", None) == ticket or getattr(d, "position", None) == ticket]
+        if not matched:
+            return None
+
+        matched.sort(key=lambda d: getattr(d, "time", 0))
+        for deal in reversed(matched):
+            entry = getattr(deal, "entry", None)
+            if entry in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_OUT_BY", None)):
+                return {
+                    'reason': map_reason_from_deal_reason(getattr(deal, "reason", None)),
+                    'profit': float(getattr(deal, "profit", 0.0) or 0.0),
+                    'price': float(getattr(deal, "price", 0.0) or 0.0),
+                    'volume': float(getattr(deal, "volume", 0.0) or 0.0),
+                }
+    except Exception:
+        return None
+
+    return None
+
+
+def get_position_detail(client, ticket):
+    """Query MT5 for position details including profit info.
+    
+    Returns dict with position info or None if failed.
     """
     client.send("POSITION_GET", {"ticket": ticket})
     resp = client.get_response(timeout=5)
     if resp and resp.get("success"):
-        try:
-            return float(resp.get("profit", 0.0))
-        except Exception:
-            return 0.0
-    return 0.0
+        return resp
+    return None
 
 
 def load_batch_info():
-    """Đọc batch info từ file JSON."""
+    """Doc batch info tu file JSON."""
     try:
         if os.path.exists(BATCH_INFO_FILE):
             with open(BATCH_INFO_FILE, 'r') as f:
@@ -147,7 +230,7 @@ def load_batch_info():
 
 
 def save_batch_info(batch_info):
-    """Lưu batch info vào file JSON."""
+    """Luu batch info vao file JSON."""
     try:
         os.makedirs(os.path.dirname(BATCH_INFO_FILE), exist_ok=True)
     except Exception:
@@ -161,7 +244,7 @@ def save_batch_info(batch_info):
 
 
 def update_batch_closed_info(batch_info, magic, closed_count, closed_pnl):
-    """Cập nhật thông tin đã đóng cho batch."""
+    """Cap nhat thong tin da dong cho batch."""
     magic_str = str(magic)
     if magic_str not in batch_info:
         batch_info[magic_str] = {}
@@ -172,7 +255,7 @@ def update_batch_closed_info(batch_info, magic, closed_count, closed_pnl):
 
 
 def clear_batch_closed_info(batch_info, magic):
-    """Xóa thông tin đã đóng của batch."""
+    """Xoa thong tin da dong cua batch."""
     magic_str = str(magic)
     if magic_str in batch_info:
         batch_info[magic_str]['closed_count'] = 0
@@ -217,47 +300,57 @@ def parse_comment(comment: str):
 
 def main():
     print("=" * 60)
-    print("ORDER MONITOR - Theo dõi và đóng theo từng position")
+    print("ORDER MONITOR v3 - Theo doi va dong theo tung position")
     print("=" * 60)
     print(f"  Symbol: {SYMBOL}")
     print(f"  Check Interval: {CHECK_INTERVAL}s")
+    print(f"  Slack Notify Port: {SLACK_NOTIFY_PORT}")
     print("=" * 60)
     print()
     
     client = OrderClient(port=PORT)
     slack_notifier = SlackNotifier(port=SLACK_NOTIFY_PORT)
     
-    # Reset batch info khi khởi chạy
+    # Reset batch info khi khoi chay
     batch_info = load_batch_info()
     for magic in batch_info:
         batch_info[magic]['closed_count'] = 0
         batch_info[magic]['closed_pnl'] = 0.0
     save_batch_info(batch_info)
-    print("Đã reset batch info!")
+    print("Da reset batch info!")
     
-    # Lấy positions hiện tại
-    print("Đang lấy positions hiện tại...")
+    # Lay positions hien tai
+    print("Dang lay positions hien tai...")
     positions = get_all_positions(client, SYMBOL)
     
+    # === TRACKING VARIABLES ===
+    # Track known positions to detect when they disappear (MT5 TP/SL auto-close)
+    known_tickets = set()  # Tickets we've seen
+    confirmed_closed_tickets = set()  # Tickets we explicitly closed (for TP/SL detection)
+    
     if not positions:
-        print("Không có positions nào!")
-        print("Đang chờ positions mới...")
-        print("Nhấn Ctrl+C để thoát")
+        print("Khong co positions nao!")
+        print("Dang cho positions moi...")
+        print("Nhan Ctrl+C de thoat")
     else:
-        print(f"Tìm thấy {len(positions)} positions:")
+        print(f"Tim thay {len(positions)} positions:")
         for p in positions:
             magic, target = parse_comment(p.get('comment', ''))
-            print(f"  #{p.get('ticket')}: Magic={magic} | Target=${target} | P&L: ${p.get('profit', 0):+.2f}")
+            ticket = p.get('ticket')
+            known_tickets.add(ticket)
+            print(f"  #{ticket}: Magic={magic} | Target=${target} | P&L: ${p.get('profit', 0):+.2f}")
     
     print()
-    print("Bắt đầu theo dõi... (Ctrl+C để dừng)")
+    print("Bat dau theo doi... (Ctrl+C de dung)")
     print("-" * 60)
     
     total_pnl_achieved = 0.0
     total_closed = 0
     global_closed_pnl = 0.0
     global_closed_count = 0
-    # Theo dõi lỗ/lãi riêng
+    known_positions = {}
+    processed_closed_tickets = set()
+    # Theo doi lo/lai rieng
     loss_closed_count = 0
     loss_closed_pnl = 0.0
     profit_closed_count = 0
@@ -270,6 +363,60 @@ def main():
             
             i += 1
             elapsed = round(i * CHECK_INTERVAL, 1)
+            
+            current_tickets = set()
+            for p in positions:
+                ticket = p.get('ticket')
+                current_tickets.add(ticket)
+                known_tickets.add(ticket)
+                known_positions[ticket] = normalize_position_snapshot(p)
+
+            missing_tickets = known_tickets - current_tickets - confirmed_closed_tickets - processed_closed_tickets
+
+            if missing_tickets:
+                print(f"\n!!! DETECTED {len(missing_tickets)} MISSING POSITION(S):")
+                for ticket in sorted(missing_tickets):
+                    snapshot = known_positions.get(ticket, {})
+                    hist = get_position_history_reason(ticket)
+                    reason = hist.get('reason') if hist else None
+                    profit = hist.get('profit') if hist and hist.get('profit') is not None else float(snapshot.get('profit', 0) or 0)
+                    price = hist.get('price') if hist and hist.get('price') is not None else float(snapshot.get('price_open', 0) or 0)
+                    volume = hist.get('volume') if hist and hist.get('volume') is not None else float(snapshot.get('volume', 0) or 0)
+                    direction = snapshot.get('type', 'UNKNOWN')
+                    magic = snapshot.get('magic', 0)
+
+                    if not reason:
+                        if snapshot.get('take_profit'):
+                            reason = 'TP' if profit >= 0 else 'SL'
+                        elif snapshot.get('stop_loss'):
+                            reason = 'SL' if profit <= 0 else 'TP'
+                        else:
+                            reason = 'UNKNOWN'
+
+                    print(f"  #{ticket}: Auto-closed as {reason} | P&L: ${profit:+.2f}")
+
+                    slack_notifier.send_close_notify(
+                        ticket=ticket,
+                        direction=direction,
+                        volume=volume,
+                        price=price,
+                        profit=profit,
+                        magic=magic,
+                        reason=reason
+                    )
+
+                    processed_closed_tickets.add(ticket)
+                    known_positions.pop(ticket, None)
+                    global_closed_pnl += profit
+                    global_closed_count += 1
+                    if profit >= 0:
+                        profit_closed_count += 1
+                        profit_closed_pnl += profit
+                    else:
+                        loss_closed_count += 1
+                        loss_closed_pnl += profit
+            
+            # === END MISSING POSITION DETECTION ===
             
             if positions:
                 # Group positions theo magic number
@@ -284,39 +431,39 @@ def main():
                         'volume': p.get('volume')
                     })
                 
-                # Đọc batch info từ file JSON
+                # Doc batch info tu file JSON
                 batch_info = load_batch_info()
                 
-                # Print status - mỗi batch 1 dòng
+                # Print status - moi batch 1 dong
                 print(f"[{elapsed:6.1f}s]")
                 total_closed_pnl = 0.0
                 total_closed_count = 0
                 total_pnl_all = 0.0
                 batch_info = load_batch_info()
-                batches_to_close = []  # Các batch cần đóng toàn bộ
+                batches_to_close = []  # Cac batch can dong toan bo
                 
                 for magic, pos_list in magic_groups.items():
                     pnl = sum(p.get('profit', 0) for p in pos_list)
                     target = batch_info.get(str(magic), {}).get('pnl_target', '?')
                     closed_count = batch_info.get(str(magic), {}).get('closed_count', 0)
                     closed_pnl = batch_info.get(str(magic), {}).get('closed_pnl', 0.0)
-                    total_batch_pnl = pnl + closed_pnl  # Tổng PNL = đang mở + đã đóng
+                    total_batch_pnl = pnl + closed_pnl  # Tong PNL = dang mo + da dong
                     total_closed_pnl += closed_pnl
                     total_closed_count += closed_count
                     total_pnl_all += total_batch_pnl
-                    print(f"  Magic#{magic}: {len(pos_list)} pos đang mở | PnL: ${pnl:+.2f}/{target} | Đã đóng: {closed_count} pos, PnL: ${closed_pnl:+.2f} | Tổng: ${total_batch_pnl:+.2f}")
+                    print(f"  Magic#{magic}: {len(pos_list)} pos dang mo | PnL: ${pnl:+.2f}/{target} | Da dong: {closed_count} pos, PnL: ${closed_pnl:+.2f} | Tong: ${total_batch_pnl:+.2f}")
                     
-                    # Kiểm tra nếu batch đạt target thì đóng toàn bộ
+                    # Kiem tra neu batch dat target thi dong toan bo
                     if BATCH_PROFIT_TARGET > 0 and total_batch_pnl >= BATCH_PROFIT_TARGET:
                         batches_to_close.append({'magic': magic, 'pos_list': pos_list, 'total_pnl': total_batch_pnl})
                 
-                # Print 4 dòng tổng hợp
-                print(f"  Đang mở: {len(positions)} pos, PnL: ${total_pnl_all:+.2f}")
-                print(f"  Đã đóng (lỗ): {loss_closed_count} pos, PnL: ${loss_closed_pnl:+.2f}")
-                print(f"  Đã đóng (lãi): {profit_closed_count} pos, PnL: ${profit_closed_pnl:+.2f}")
-                print(f"  Tổng đã đóng: {global_closed_count} pos, PnL: ${global_closed_pnl:+.2f}")
+                # Print 4 dong tong hop
+                print(f"  Dang mo: {len(positions)} pos, PnL: ${total_pnl_all:+.2f}")
+                print(f"  Da dong (lo): {loss_closed_count} pos, PnL: ${loss_closed_pnl:+.2f}")
+                print(f"  Da dong (lai): {profit_closed_count} pos, PnL: ${profit_closed_pnl:+.2f}")
+                print(f"  Tong da dong: {global_closed_count} pos, PnL: ${global_closed_pnl:+.2f}")
                 
-                # Check từng position trong từng batch
+                # Check tung position trong tung batch
                 positions_to_close = []
                 positions_to_close_sl = []
                 for magic, pos_list in magic_groups.items():
@@ -328,9 +475,9 @@ def main():
                         elif STOP_LOSS > 0 and pos['profit'] <= -STOP_LOSS:
                             positions_to_close_sl.append(pos)
                 
-                # Đóng các positions đạt target
+                # Dong cac positions dat target
                 if positions_to_close:
-                    print(f"\n>>> Đóng {len(positions_to_close)} position(s) đạt target...")
+                    print(f"\n>>> Dong {len(positions_to_close)} position(s) dat target...")
                     
                     for pos in positions_to_close:
                         print(f"  Position #{pos['ticket']}: P&L ${pos['profit']:.2f} >= Target ${pos['target']:.2f}")
@@ -338,21 +485,27 @@ def main():
                         
                         if resp and resp.get('success'):
                             print(f"    SUCCESS!")
-                            # Gửi Slack notification
+                            # Gui Slack notification
                             slack_notifier.send_close_notify(
                                 ticket=pos['ticket'],
                                 direction=pos.get('type', 'UNKNOWN'),
                                 volume=pos.get('volume', 0),
                                 price=pos.get('price_open', 0),
                                 profit=pos['profit'],
-                                magic=pos.get('magic', 0)
+                                magic=pos.get('magic', 0),
+                                reason="MANUAL"
                             )
+                            
+                            # Track as explicitly closed
+                            confirmed_closed_tickets.add(pos['ticket'])
+                            processed_closed_tickets.add(pos['ticket'])
+                            
                             total_pnl_achieved += pos['profit']
                             total_closed += 1
                             global_closed_pnl += pos['profit']
                             global_closed_count += 1
                             
-                            # Cập nhật lãi/lỗ
+                            # Cap nhat lai/lo
                             if pos['profit'] >= 0:
                                 profit_closed_count += 1
                                 profit_closed_pnl += pos['profit']
@@ -360,14 +513,14 @@ def main():
                                 loss_closed_count += 1
                                 loss_closed_pnl += pos['profit']
                             
-                            # Cập nhật thông tin đã đóng cho batch
+                            # Cap nhat thong tin da dong cho batch
                             batch_info = update_batch_closed_info(batch_info, pos['magic'], 1, pos['profit'])
                         else:
                             print(f"    FAILED: {resp.get('error_message', 'Unknown') if resp else 'No response'}")
                 
-                # Đóng các positions chạm Stop Loss
+                # Dong cac positions cham Stop Loss
                 if positions_to_close_sl:
-                    print(f"\n>>> Đóng {len(positions_to_close_sl)} position(s) chạm SL (<= -${STOP_LOSS})...")
+                    print(f"\n>>> Dong {len(positions_to_close_sl)} position(s) cham SL (<= -${STOP_LOSS})...")
                     
                     for pos in positions_to_close_sl:
                         print(f"  Position #{pos['ticket']}: P&L ${pos['profit']:.2f} <= -${STOP_LOSS} (SL)")
@@ -375,21 +528,27 @@ def main():
                         
                         if resp and resp.get('success'):
                             print(f"    SUCCESS!")
-                            # Gửi Slack notification
+                            # Gui Slack notification
                             slack_notifier.send_close_notify(
                                 ticket=pos['ticket'],
                                 direction=pos.get('type', 'UNKNOWN'),
                                 volume=pos.get('volume', 0),
                                 price=pos.get('price_open', 0),
                                 profit=pos['profit'],
-                                magic=pos.get('magic', 0)
+                                magic=pos.get('magic', 0),
+                                reason="SL"
                             )
+                            
+                            # Track as explicitly closed
+                            confirmed_closed_tickets.add(pos['ticket'])
+                            processed_closed_tickets.add(pos['ticket'])
+                            
                             total_pnl_achieved += pos['profit']
                             total_closed += 1
                             global_closed_pnl += pos['profit']
                             global_closed_count += 1
                             
-                            # Cập nhật lãi/lỗ
+                            # Cap nhat lai/lo
                             if pos['profit'] >= 0:
                                 profit_closed_count += 1
                                 profit_closed_pnl += pos['profit']
@@ -397,37 +556,43 @@ def main():
                                 loss_closed_count += 1
                                 loss_closed_pnl += pos['profit']
                             
-                            # Cập nhật thông tin đã đóng cho batch
+                            # Cap nhat thong tin da dong cho batch
                             batch_info = update_batch_closed_info(batch_info, pos['magic'], 1, pos['profit'])
                         else:
                             print(f"    FAILED: {resp.get('error_message', 'Unknown') if resp else 'No response'}")
                 
-                # Đóng toàn bộ batch khi đạt target PNL
+                # Dong toan bo batch khi dat target PNL
                 if batches_to_close:
                     for batch in batches_to_close:
                         magic = batch['magic']
                         pos_list = batch['pos_list']
                         total_batch_pnl = batch['total_pnl']
-                        print(f"\n>>> BATCH Magic#{magic} đạt target! Tổng PNL: ${total_batch_pnl:+.2f} >= ${BATCH_PROFIT_TARGET}")
-                        print(f"    Đóng {len(pos_list)} position(s) còn lại...")
+                        print(f"\n>>> BATCH Magic#{magic} dat target! Tong PNL: ${total_batch_pnl:+.2f} >= ${BATCH_PROFIT_TARGET}")
+                        print(f"    Dong {len(pos_list)} position(s) con lai...")
                         
                         closed_batch_pnl = 0.0
                         closed_batch_count = 0
                         for pos in pos_list:
-                            print(f"  Position #{pos['ticket']}: P&L ${pos['profit']:.2f} (đóng batch)")
+                            print(f"  Position #{pos['ticket']}: P&L ${pos['profit']:.2f} (dong batch)")
                             resp = close_position(client, pos['ticket'])
                             
                             if resp and resp.get('success'):
                                 print(f"    SUCCESS!")
-                                # Gửi Slack notification
+                                # Gui Slack notification
                                 slack_notifier.send_close_notify(
                                     ticket=pos['ticket'],
                                     direction=pos.get('type', 'UNKNOWN'),
                                     volume=pos.get('volume', 0),
                                     price=pos.get('price_open', 0),
                                     profit=pos['profit'],
-                                    magic=pos.get('magic', 0)
+                                    magic=pos.get('magic', 0),
+                                    reason="BATCH"
                                 )
+                                
+                                # Track as explicitly closed
+                                confirmed_closed_tickets.add(pos['ticket'])
+                                processed_closed_tickets.add(pos['ticket'])
+
                                 total_pnl_achieved += pos['profit']
                                 total_closed += 1
                                 global_closed_pnl += pos['profit']
@@ -435,7 +600,7 @@ def main():
                                 closed_batch_pnl += pos['profit']
                                 closed_batch_count += 1
                                 
-                                # Cập nhật lãi/lỗ
+                                # Cap nhat lai/lo
                                 if pos['profit'] >= 0:
                                     profit_closed_count += 1
                                     profit_closed_pnl += pos['profit']
@@ -445,34 +610,38 @@ def main():
                             else:
                                 print(f"    FAILED: {resp.get('error_message', 'Unknown') if resp else 'No response'}")
                         
-                        # Cộng dồn PNL đã đóng của batch vào batch_info
+                        # Cong don PNL da dong cua batch vao batch_info
                         batch_info = update_batch_closed_info(batch_info, magic, closed_batch_count, closed_batch_pnl)
-                        # Reset batch về từ đầu
+                        # Reset batch ve tu dau
                         batch_info = clear_batch_closed_info(batch_info, magic)
-                        print(f"    Batch Magic#{magic} đã reset!")
+                        print(f"    Batch Magic#{magic} da reset!")
             else:
-                print(f"[{elapsed:6.1f}s] Chờ positions mới...")
+                print(f"[{elapsed:6.1f}s] Cho positions moi...")
             
             time.sleep(CHECK_INTERVAL)
     
     except KeyboardInterrupt:
-        print("\n\nDừng theo dõi!")
+        print("\n\nDung theo doi!")
         
-        # Đóng các positions còn lại
+        # Dong cac positions con lai
         positions = get_all_positions(client, SYMBOL)
         if positions:
-            print("Đóng các positions còn lại...")
+            print("Dong cac positions con lai...")
             for p in positions:
                 ticket = p.get('ticket')
                 resp = close_position(client, ticket)
                 if resp and resp.get('success'):
                     print(f"  #{ticket}: CLOSED")
+                    confirmed_closed_tickets.add(ticket)
+                    processed_closed_tickets.add(ticket)
                 else:
                     print(f"  #{ticket}: FAILED")
     
     print("\n" + "=" * 60)
-    print(f"Tổng P&L đã đạt: ${total_pnl_achieved:+.2f}")
-    print(f"Số positions đã đóng: {total_closed}")
+    print(f"Tong P&L da dat: ${total_pnl_achieved:+.2f}")
+    print(f"So positions da dong: {total_closed}")
+    print(f"Tong P&L tat ca (bao gom TP/SL): ${global_closed_pnl:+.2f}")
+    print(f"Tong so positions: {global_closed_count}")
     print("=" * 60)
     
     client.close()

@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use log::debug;
 
 // ============================================================
 // CONSTANTS & TYPE DEFINITIONS
@@ -57,6 +58,7 @@ pub struct Signal {
     pub stop_loss: f64,
     pub take_profit: f64,
     pub reason: String,
+    pub debug: String,
     pub breakdown: ScoreBreakdown,
 }
 
@@ -72,12 +74,13 @@ pub enum SignalAction {
 pub struct ScoreBreakdown {
     pub trend: i32,           // 0-2
     pub strength: i32,        // 0-2
-    pub structure: i32,      // 0-2
-    pub pullback: i32,       // 0-1
-    pub rsi: i32,            // 0-1
-    pub volatility: i32,     // 0-1
-    pub confirmation: i32,   // 0-1
-    pub total: i32,          // Sum
+    pub structure: i32,       // 0-2
+    pub pullback: i32,        // 0-1
+    pub rsi: i32,             // 0-1
+    pub volatility: i32,      // 0-1
+    pub confirmation: i32,    // 0-1
+    pub reversal_risk: i32,   // -3..0 penalty
+    pub total: i32,           // Sum
 }
 
 /// Candle OHLCV data structure (zero-copy friendly)
@@ -267,8 +270,14 @@ pub struct State {
     pub recent_trade_prices: VecDeque<f64>,
     
     // Confirmation candle state
-    pending_long_setup: Option<f64>,  // Price level for confirmation
-    pending_short_setup: Option<f64>,
+    pending_long_setup: Option<i64>,  // timestamp for confirmation
+    pending_short_setup: Option<i64>,
+
+    // Recent candle behavior for reversal detection
+    pub recent_bullish_streak: usize,
+    pub recent_bearish_streak: usize,
+    pub last_candle_direction: Option<Direction>,
+    pub last_candle_range: Option<f64>,
     
     // Debug counters
     pub ticks_processed: u64,
@@ -303,6 +312,10 @@ impl State {
             recent_trade_prices: VecDeque::with_capacity(10),
             pending_long_setup: None,
             pending_short_setup: None,
+            recent_bullish_streak: 0,
+            recent_bearish_streak: 0,
+            last_candle_direction: None,
+            last_candle_range: None,
             ticks_processed: 0,
         }
     }
@@ -335,6 +348,32 @@ impl State {
         if self.candles.len() > 50 {
             self.candles.pop_front();
         }
+
+        let dir = if candle.close > candle.open {
+            Direction::Long
+        } else if candle.close < candle.open {
+            Direction::Short
+        } else {
+            Direction::None
+        };
+
+        match dir {
+            Direction::Long => {
+                self.recent_bullish_streak += 1;
+                self.recent_bearish_streak = 0;
+            }
+            Direction::Short => {
+                self.recent_bearish_streak += 1;
+                self.recent_bullish_streak = 0;
+            }
+            Direction::None => {
+                self.recent_bullish_streak = 0;
+                self.recent_bearish_streak = 0;
+            }
+        }
+
+        self.last_candle_direction = Some(dir);
+        self.last_candle_range = Some(candle.range());
     }
     
     pub fn record_trade(&mut self, price: f64, won: bool) {
@@ -574,9 +613,102 @@ pub fn is_in_no_trade_zone(price: f64, recent_prices: &VecDeque<f64>, zone_pips:
 // SCORING SYSTEM (PRIMARY DECISION MECHANISM)
 // ============================================================
 
+// Helper wrappers to log reasons when returning early
+fn ret_hold(reason: &str) -> Signal {
+    debug!("STRATEGY HOLD: {}", reason);
+    Signal::hold(reason)
+}
+
+fn ret_skip(reason: &str) -> Signal {
+    debug!("STRATEGY SKIP: {}", reason);
+    Signal::skip(reason)
+}
+
+
 /// Calculate comprehensive trade score
 /// Returns (score, confidence, breakdown)
 #[inline]
+pub fn detect_reversal_risk(
+    current_candle: &Candle,
+    state: &State,
+    direction: Direction,
+    _cfg: &Config,
+) -> (i32, String) {
+    let mut penalty = 0;
+    let mut reasons = Vec::new();
+    let body = current_candle.body().max(0.0001);
+    let range = current_candle.range().max(0.0001);
+    let upper_wick = current_candle.upper_wick();
+    let lower_wick = current_candle.lower_wick();
+    let wick_body_ratio = upper_wick.max(lower_wick) / body;
+    let close_position = (current_candle.close - current_candle.low) / range;
+
+    match direction {
+        Direction::Long => {
+            if current_candle.close < current_candle.open { penalty -= 1; reasons.push("bearish candle"); }
+            if upper_wick > body * 1.2 { penalty -= 1; reasons.push("upper wick"); }
+            if wick_body_ratio > 2.0 { penalty -= 1; reasons.push("wick/body too large"); }
+            if state.recent_bearish_streak >= 2 { penalty -= 1; reasons.push("bearish streak"); }
+            if close_position < 0.35 { penalty -= 1; reasons.push("close near low"); }
+        }
+        Direction::Short => {
+            if current_candle.close > current_candle.open { penalty -= 1; reasons.push("bullish candle"); }
+            if lower_wick > body * 1.2 { penalty -= 1; reasons.push("lower wick"); }
+            if wick_body_ratio > 2.0 { penalty -= 1; reasons.push("wick/body too large"); }
+            if state.recent_bullish_streak >= 2 { penalty -= 1; reasons.push("bullish streak"); }
+            if close_position > 0.65 { penalty -= 1; reasons.push("close near high"); }
+        }
+        Direction::None => {}
+    }
+
+    if let Some(prev_range) = state.last_candle_range {
+        if range > prev_range * 1.6 { penalty -= 1; reasons.push("range expansion"); }
+    }
+
+    if penalty < -3 { penalty = -3; }
+    (penalty, reasons.join("; "))
+}
+
+pub fn build_debug_line(
+    direction: Direction,
+    price: f64,
+    ema_fast: f64,
+    ema_slow: f64,
+    rsi: f64,
+    atr: f64,
+    structure: SwingType,
+    reversal_reason: &str,
+    reversal_penalty: i32,
+    structure_soft_penalty: i32,
+    score: i32,
+    confidence: f64,
+    breakdown: &ScoreBreakdown,
+) -> String {
+    format!(
+        "dir={:?} price={:.2} ema20={:.2} ema50={:.2} rsi={:.1} atr={:.3} struct={:?} rev_pen={} struct_pen={} score={} conf={:.2} break[T:{} S:{} St:{} P:{} R:{} V:{} C:{} Rev:{}] reason={}",
+        direction,
+        price,
+        ema_fast,
+        ema_slow,
+        rsi,
+        atr,
+        structure,
+        reversal_penalty,
+        structure_soft_penalty,
+        score,
+        confidence,
+        breakdown.trend,
+        breakdown.strength,
+        breakdown.structure,
+        breakdown.pullback,
+        breakdown.rsi,
+        breakdown.volatility,
+        breakdown.confirmation,
+        breakdown.reversal_risk,
+        reversal_reason
+    )
+}
+
 pub fn calculate_score(
     price: f64,
     ema_fast: f64,
@@ -616,15 +748,16 @@ pub fn calculate_score(
     };
     
     // === STRUCTURE SCORE (0-2) ===
-    // Structure must align with direction
+    // Structure is now a soft score, not a hard blocker
     match (direction, structure) {
         (Direction::Long, SwingType::HigherHigh) => breakdown.structure = 2,
         (Direction::Long, SwingType::HigherLow) => breakdown.structure = 1,
+        (Direction::Long, SwingType::LowerHigh) => breakdown.structure = -1,
+        (Direction::Long, SwingType::LowerLow) => breakdown.structure = -2,
         (Direction::Short, SwingType::LowerLow) => breakdown.structure = 2,
         (Direction::Short, SwingType::LowerHigh) => breakdown.structure = 1,
-        // Opposite structure = anti
-        (Direction::Long, SwingType::LowerHigh) => breakdown.structure = -1,
-        (Direction::Short, SwingType::HigherHigh) => breakdown.structure = -1,
+        (Direction::Short, SwingType::HigherLow) => breakdown.structure = -1,
+        (Direction::Short, SwingType::HigherHigh) => breakdown.structure = -2,
         _ => breakdown.structure = 0,
     }
     
@@ -632,7 +765,7 @@ pub fn calculate_score(
     let pullback_distance = (price - ema_fast).abs() / cfg.pip_value;
     if pullback_distance <= cfg.max_pullback_pips {
         breakdown.pullback = 1;
-    } else if pullback_distance <= cfg.max_pullback_pips * 1.5 {
+    } else if pullback_distance <= cfg.max_pullback_pips * 2.0 {
         breakdown.pullback = 0;
     }
     
@@ -648,7 +781,7 @@ pub fn calculate_score(
                 let prev = rsi_prev.unwrap_or(rsi);
                 if rsi > 50.0 && prev < 40.0 {
                     breakdown.rsi = 1;
-                } else if rsi > 50.0 {
+                } else if rsi > 45.0 {
                     breakdown.rsi = 1;
                 } else {
                     breakdown.rsi = 0;
@@ -663,7 +796,7 @@ pub fn calculate_score(
                 let prev = rsi_prev.unwrap_or(rsi);
                 if rsi < 50.0 && prev > 60.0 {
                     breakdown.rsi = 1;
-                } else if rsi < 50.0 {
+                } else if rsi < 55.0 {
                     breakdown.rsi = 1;
                 } else {
                     breakdown.rsi = 0;
@@ -674,17 +807,21 @@ pub fn calculate_score(
     }
     
     // === VOLATILITY SCORE (0-1) ===
-    // Placeholder - actual check done separately
-    breakdown.volatility = 1; // Assumed OK unless checked otherwise
+    breakdown.volatility = 1;
     
     // === CONFIRMATION SCORE (0-1) ===
-    // Placeholder - actual check done separately  
     breakdown.confirmation = 1;
+
+    // === REVERSION RISK PENALTY ===
+    breakdown.reversal_risk = 0;
+    if direction == Direction::Long && structure == SwingType::HigherHigh { breakdown.reversal_risk = 0; }
+    if direction == Direction::Short && structure == SwingType::LowerLow { breakdown.reversal_risk = 0; }
     
     // === TOTAL SCORE ===
     breakdown.total = breakdown.trend + breakdown.strength + 
                       breakdown.structure + breakdown.pullback + 
-                      breakdown.rsi + breakdown.volatility + breakdown.confirmation;
+                      breakdown.rsi + breakdown.volatility + breakdown.confirmation +
+                      breakdown.reversal_risk;
     
     // === CONFIDENCE (0-1) ===
     let max_possible = 10;
@@ -719,22 +856,22 @@ pub fn should_trade(
     
     let ema_fast = match calc_ema(&prices_slice, cfg.ema_fast) {
         Some(v) => v,
-        None => return Signal::hold("WARMUP: waiting for EMA data"),
+        None => return ret_hold("WARMUP: waiting for EMA data"),
     };
     
     let ema_slow = match calc_ema(&prices_slice, cfg.ema_slow) {
         Some(v) => v,
-        None => return Signal::hold("WARMUP: waiting for EMA slow data"),
+        None => return ret_hold("WARMUP: waiting for EMA slow data"),
     };
     
     let atr = match calc_atr(&highs_slice, &lows_slice, &closes_slice, cfg.atr_period) {
         Some(v) => v,
-        None => return Signal::hold("WARMUP: waiting for ATR data"),
+        None => return ret_hold("WARMUP: waiting for ATR data"),
     };
     
     let rsi = match calc_rsi(&closes_slice, cfg.rsi_period) {
         Some(v) => v,
-        None => return Signal::hold("WARMUP: waiting for RSI data"),
+        None => return ret_hold("WARMUP: waiting for RSI data"),
     };
     
     // Update state
@@ -750,7 +887,7 @@ pub fn should_trade(
     if state.consecutive_losses >= cfg.max_consecutive_losses {
         let pause_end = state.last_loss_time.unwrap_or(0) + (cfg.pause_duration_minutes * 60);
         if current_candle.time < pause_end {
-            return Signal::hold(&format!(
+            return ret_hold(&format!(
                 "COOLDOWN: {} consecutive losses, pausing until {}",
                 state.consecutive_losses, pause_end
             ));
@@ -761,24 +898,24 @@ pub fn should_trade(
     
     if state.cooldown_counter > 0 {
         state.cooldown_counter -= 1;
-        return Signal::hold(&format!("COOLDOWN: {} ticks remaining", state.cooldown_counter));
+        return ret_hold(&format!("COOLDOWN: {} ticks remaining", state.cooldown_counter));
     }
     
     // ============================================================
     // STEP 3: Check position limits
     // ============================================================
     if state.long_positions >= cfg.max_positions_per_direction {
-        return Signal::hold("LIMIT: max long positions reached");
+        return ret_hold("LIMIT: max long positions reached");
     }
     if state.short_positions >= cfg.max_positions_per_direction {
-        return Signal::hold("LIMIT: max short positions reached");
+        return ret_hold("LIMIT: max short positions reached");
     }
     
     // ============================================================
     // STEP 4: FILTER 1 - Sideway check (MANDATORY)
     // ============================================================
     if is_sideway(ema_fast, ema_slow, cfg.sideway_ema_threshold) {
-        return Signal::skip("FILTER: Sideway market (EMA convergence)");
+        return ret_skip("FILTER: Sideway market (EMA convergence)");
     }
     
     // ============================================================
@@ -786,7 +923,7 @@ pub fn should_trade(
     // ============================================================
     let strength = trend_strength(ema_fast, ema_slow);
     if strength < cfg.min_trend_strength {
-        return Signal::skip(&format!(
+        return ret_skip(&format!(
             "FILTER: Weak trend strength {:.3} < {:.3}",
             strength, cfg.min_trend_strength
         ));
@@ -802,7 +939,6 @@ pub fn should_trade(
     // ============================================================
     let structure = detect_structure(&highs_slice, &lows_slice, 20);
     
-    // Structure must align with trend direction
     let structure_valid = match (direction, structure) {
         (Direction::Long, SwingType::HigherHigh) => true,
         (Direction::Long, SwingType::HigherLow) => true,
@@ -811,22 +947,10 @@ pub fn should_trade(
         _ => false,
     };
     
-    if !structure_valid {
-        return Signal::skip(&format!(
-            "FILTER: Structure {:?} doesn't match direction {:?}",
-            structure, direction
-        ));
-    }
-    
-    // Anti-pattern: don't SELL when HL forming, don't BUY when LH forming
-    match structure {
-        SwingType::HigherLow if direction == Direction::Short => {
-            return Signal::skip("FILTER: HL forming - no SELL");
-        }
-        SwingType::LowerHigh if direction == Direction::Long => {
-            return Signal::skip("FILTER: LH forming - no BUY");
-        }
-        _ => {}
+    let structure_soft_penalty = if structure_valid { 0 } else { -1 };
+    let (reversal_penalty, reversal_reason) = detect_reversal_risk(current_candle, state, direction, cfg);
+    if reversal_penalty <= -3 {
+        return ret_skip(&format!("FILTER: reversal risk too high ({})", reversal_reason));
     }
     
     // ============================================================
@@ -834,10 +958,39 @@ pub fn should_trade(
     // ============================================================
     if !is_pullback(price, ema_fast, cfg.max_pullback_pips, cfg.pip_value) {
         let dist = (price - ema_fast).abs() / cfg.pip_value;
-        return Signal::skip(&format!(
-            "FILTER: Not in pullback zone ({:.1} pips from EMA)",
-            dist
-        ));
+        if dist > cfg.max_pullback_pips * 2.0 {
+            return ret_skip(&format!(
+                "FILTER: Too far from EMA ({:.1} pips)",
+                dist
+            ));
+        }
+    }
+
+    let body = current_candle.body().max(0.0001);
+    let range = current_candle.range().max(0.0001);
+    let wick_ratio = current_candle.upper_wick().max(current_candle.lower_wick()) / body;
+    let close_pos = (current_candle.close - current_candle.low) / range;
+
+    if direction == Direction::Long {
+        if current_candle.close < current_candle.open && wick_ratio > 1.5 {
+            return ret_skip("FILTER: bearish rejection candle - avoid BUY");
+        }
+        if current_candle.upper_wick() > body * 1.0 && close_pos < 0.6 {
+            return ret_skip("FILTER: weak bullish close - possible reversal");
+        }
+        if state.recent_bearish_streak >= 2 && current_candle.close <= current_candle.open {
+            return ret_skip("FILTER: bearish streak with weak candle - avoid BUY");
+        }
+    } else if direction == Direction::Short {
+        if current_candle.close > current_candle.open && wick_ratio > 1.5 {
+            return ret_skip("FILTER: bullish rejection candle - avoid SELL");
+        }
+        if current_candle.lower_wick() > body * 1.0 && close_pos > 0.4 {
+            return ret_skip("FILTER: weak bearish close - possible reversal");
+        }
+        if state.recent_bullish_streak >= 2 && current_candle.close >= current_candle.open {
+            return ret_skip("FILTER: bullish streak with weak candle - avoid SELL");
+        }
     }
     
     // ============================================================
@@ -849,7 +1002,7 @@ pub fn should_trade(
     match direction {
         Direction::Long => {
             if rsi >= cfg.rsi_overbought {
-                return Signal::skip(&format!(
+                return ret_skip(&format!(
                     "FILTER: RSI {:.1} in overbought zone",
                     rsi
                 ));
@@ -857,17 +1010,17 @@ pub fn should_trade(
         }
         Direction::Short => {
             if rsi <= cfg.rsi_oversold {
-                return Signal::skip(&format!(
+                return ret_skip(&format!(
                     "FILTER: RSI {:.1} in oversold zone",
                     rsi
                 ));
             }
         }
-        Direction::None => return Signal::hold("No direction determined"),
+        Direction::None => return ret_hold("No direction determined"),
     }
     
     if !rsi_ok {
-        return Signal::skip(&format!(
+        return ret_skip(&format!(
             "FILTER: RSI confirmation failed (current: {:.1})",
             rsi
         ));
@@ -884,7 +1037,7 @@ pub fn should_trade(
     );
     
     if !vol_ok {
-        return Signal::skip(&format!("FILTER: {}", vol_reason));
+        return ret_skip(&format!("FILTER: {}", vol_reason));
     }
     
     // ============================================================
@@ -892,7 +1045,7 @@ pub fn should_trade(
     // ============================================================
     if !check_anti_fomo(price, ema_fast, cfg.max_fomo_pips, cfg.pip_value) {
         let dist = (price - ema_fast).abs() / cfg.pip_value;
-        return Signal::skip(&format!(
+        return ret_skip(&format!(
             "FILTER: Anti-FOMO - price {:.1} pips from EMA (max: {:.1})",
             dist, cfg.max_fomo_pips
         ));
@@ -902,20 +1055,38 @@ pub fn should_trade(
     // STEP 12: FILTER 8 - No-trade zone
     // ============================================================
     if is_in_no_trade_zone(price, &state.recent_trade_prices, cfg.no_trade_zone_pips, cfg.pip_value) {
-        return Signal::skip("FILTER: No-trade zone (recent trade price)");
+        return ret_skip("FILTER: No-trade zone (recent trade price)");
     }
     
     // ============================================================
     // STEP 13: Calculate score
     // ============================================================
-    let (score, confidence, breakdown) = calculate_score(
+    let (mut score, confidence, mut breakdown) = calculate_score(
         price, ema_fast, ema_slow, rsi, state.rsi_prev,
         atr, structure, direction, cfg
     );
+    breakdown.reversal_risk = reversal_penalty + structure_soft_penalty;
+    score += reversal_penalty + structure_soft_penalty;
+    let debug_line = build_debug_line(
+        direction,
+        price,
+        ema_fast,
+        ema_slow,
+        rsi,
+        atr,
+        structure,
+        &reversal_reason,
+        reversal_penalty,
+        structure_soft_penalty,
+        score,
+        confidence,
+        &breakdown,
+    );
+    println!("[STRATEGY DEBUG] {}", debug_line);
     
     // Check minimum score threshold
     if score < cfg.min_score {
-        return Signal::skip(&format!(
+        return ret_skip(&format!(
             "FILTER: Score {} < threshold {} | breakdown: {:?}",
             score, cfg.min_score, breakdown
         ));
@@ -923,19 +1094,77 @@ pub fn should_trade(
     
     // Check confidence threshold
     if confidence < cfg.min_confidence {
-        return Signal::skip(&format!(
+        return ret_skip(&format!(
             "FILTER: Confidence {:.2} < {:.2}",
             confidence, cfg.min_confidence
         ));
     }
     
     // ============================================================
+    // CONFIRMATION: wait one additional candle to avoid entering on immediate reversal
+    // For fast M1 scalping we require the next candle to confirm direction (reduce false entries on reversal candles)
+    if direction == Direction::Long {
+        match state.pending_long_setup {
+            None => {
+                // mark current candle as pending confirmation and wait for the next candle
+                state.pending_long_setup = Some(current_candle.time);
+                // clear opposite pending
+                state.pending_short_setup = None;
+                debug!("AWAIT_CONFIRM: pending LONG at time {}", current_candle.time);
+                return ret_hold("AWAIT_CONFIRM: waiting next candle for LONG confirmation");
+            }
+            Some(pending_ts) => {
+                if current_candle.time <= pending_ts {
+                    return ret_hold("AWAIT_CONFIRM: waiting next candle for LONG confirmation");
+                }
+                // We're on the candle after the pending one - require bullish confirmation
+                let range = current_candle.range().max(0.0001);
+                let close_pos = (current_candle.close - current_candle.low) / range;
+                if current_candle.close > current_candle.open && close_pos > 0.5 {
+                    // confirmed
+                    state.pending_long_setup = None;
+                    debug!("CONFIRMED LONG at time {}", current_candle.time);
+                } else {
+                    // failed confirmation - clear and skip
+                    state.pending_long_setup = None;
+                    debug!("CONFIRM_FAIL LONG at time {}", current_candle.time);
+                    return ret_skip("CONFIRM_FAIL: LONG confirmation failed on next candle");
+                }
+            }
+        }
+    } else if direction == Direction::Short {
+        match state.pending_short_setup {
+            None => {
+                state.pending_short_setup = Some(current_candle.time);
+                state.pending_long_setup = None;
+                debug!("AWAIT_CONFIRM: pending SHORT at time {}", current_candle.time);
+                return ret_hold("AWAIT_CONFIRM: waiting next candle for SHORT confirmation");
+            }
+            Some(pending_ts) => {
+                if current_candle.time <= pending_ts {
+                    return ret_hold("AWAIT_CONFIRM: waiting next candle for SHORT confirmation");
+                }
+                let range = current_candle.range().max(0.0001);
+                let close_pos = (current_candle.close - current_candle.low) / range;
+                if current_candle.close < current_candle.open && close_pos < 0.5 {
+                    state.pending_short_setup = None;
+                    debug!("CONFIRMED SHORT at time {}", current_candle.time);
+                } else {
+                    state.pending_short_setup = None;
+                    debug!("CONFIRM_FAIL SHORT at time {}", current_candle.time);
+                    return ret_skip("CONFIRM_FAIL: SHORT confirmation failed on next candle");
+                }
+            }
+        }
+    }
+
+    // ============================================================
     // STEP 14: Calculate SL/TP
     // ============================================================
     let entry_price = match direction {
         Direction::Long => ask,
         Direction::Short => bid,
-        Direction::None => return Signal::hold("No direction for entry"),
+        Direction::None => return ret_hold("No direction for entry"),
     };
     
     // Minimum SL distance: MT5 requires >= 0.5 for GOLD
@@ -953,7 +1182,7 @@ pub fn should_trade(
     let sl_dist = (stop_loss - entry_price).abs();
     let tp_dist = (take_profit - entry_price).abs();
     if tp_dist < sl_dist * 1.5 {
-        return Signal::skip(&format!(
+        return ret_skip(&format!(
             "FILTER: TP validation failed ({:.2} vs min {:.2})",
             tp_dist, sl_dist * 1.5
         ));
@@ -991,6 +1220,7 @@ pub fn should_trade(
         stop_loss,
         take_profit,
         reason,
+        debug: debug_line,
         breakdown,
     }
 }
@@ -1010,6 +1240,7 @@ impl Signal {
             stop_loss: 0.0,
             take_profit: 0.0,
             reason: reason.to_string(),
+            debug: String::new(),
             breakdown: ScoreBreakdown::default(),
         }
     }
@@ -1024,6 +1255,7 @@ impl Signal {
             stop_loss: 0.0,
             take_profit: 0.0,
             reason: reason.to_string(),
+            debug: String::new(),
             breakdown: ScoreBreakdown::default(),
         }
     }

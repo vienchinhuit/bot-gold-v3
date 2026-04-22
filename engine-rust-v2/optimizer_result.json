@@ -1,0 +1,40 @@
+{
+  "before": {
+    "min_score": 1,
+    "min_confidence": 0.1,
+    "sideway_threshold": 0.3,
+    "min_trend_strength": 0.2,
+    "max_pullback_pips": 40.0,
+    "max_fomo_pips": 65.0,
+    "max_candle_mult": 3.5,
+    "sl_mult": 6.0,
+    "tp_mult": 12.0
+  },
+  "after": {
+    "min_score": 1,
+    "min_confidence": 0.1,
+    "sideway_threshold": 0.3,
+    "min_trend_strength": 0.2,
+    "max_pullback_pips": 40.0,
+    "max_fomo_pips": 65.0,
+    "max_candle_mult": 3.5,
+    "sl_mult": 6.0,
+    "tp_mult": 12.0
+  },
+  "metrics": {
+    "optimized_pnl": -328.0,
+    "base_winrate": 0.3333333333333333,
+    "optimized_trades": 3.0,
+    "optimized_winrate": 0.3333333333333333,
+    "base_max_drawdown": 21.0,
+    "base_avg_duration_min": 13.78888888888889,
+    "base_pnl": -328.0,
+    "optimized_expectancy": -109.33333333333333,
+    "optimized_max_drawdown": 21.0,
+    "optimized_avg_duration_min": 13.78888888888889,
+    "base_trades": 3.0,
+    "base_expectancy": -109.33333333333333
+  },
+  "rationale": [],
+  "updated_at": "2026-04-22T05:55:38.931599700+00:00"
+}
