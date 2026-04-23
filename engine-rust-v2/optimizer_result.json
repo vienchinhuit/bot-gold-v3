@@ -1,40 +1,47 @@
 {
-  "before": {
-    "min_score": 1,
-    "min_confidence": 0.1,
-    "sideway_threshold": 0.3,
+  "best_config": {
+    "ema_fast": 20,
+    "ema_slow": 50,
+    "rsi_period": 14,
+    "atr_period": 14,
+    "sideway_ema_threshold": 0.3,
     "min_trend_strength": 0.2,
     "max_pullback_pips": 40.0,
     "max_fomo_pips": 65.0,
+    "rsi_oversold": 30.0,
+    "rsi_overbought": 70.0,
+    "rsi_sell_confirm_low": 50.0,
+    "rsi_sell_confirm_high": 60.0,
+    "rsi_buy_confirm_low": 40.0,
+    "rsi_buy_confirm_high": 50.0,
     "max_candle_mult": 3.5,
-    "sl_mult": 6.0,
-    "tp_mult": 12.0
-  },
-  "after": {
-    "min_score": 1,
+    "max_wick_ratio": 0.5,
+    "min_score": 0,
     "min_confidence": 0.1,
-    "sideway_threshold": 0.3,
-    "min_trend_strength": 0.2,
-    "max_pullback_pips": 40.0,
-    "max_fomo_pips": 65.0,
-    "max_candle_mult": 3.5,
     "sl_mult": 6.0,
-    "tp_mult": 12.0
+    "tp_mult": 12.0,
+    "pip_value": 0.01,
+    "cooldown_after_loss": 15,
+    "max_consecutive_losses": 3,
+    "pause_duration_minutes": 30,
+    "max_positions_per_direction": 10,
+    "no_trade_zone_pips": 100.0,
+    "require_confirmation": true
   },
-  "metrics": {
-    "optimized_pnl": -328.0,
-    "base_winrate": 0.3333333333333333,
-    "optimized_trades": 3.0,
-    "optimized_winrate": 0.3333333333333333,
-    "base_max_drawdown": 21.0,
-    "base_avg_duration_min": 13.78888888888889,
-    "base_pnl": -328.0,
-    "optimized_expectancy": -109.33333333333333,
-    "optimized_max_drawdown": 21.0,
-    "optimized_avg_duration_min": 13.78888888888889,
-    "base_trades": 3.0,
-    "base_expectancy": -109.33333333333333
+  "train_metrics": {
+    "total_pnl": -0.0,
+    "total_trades": 0,
+    "winrate": 0.0,
+    "expectancy": 0.0,
+    "max_drawdown": 0.0,
+    "sharpe_ratio": 0.0
   },
-  "rationale": [],
-  "updated_at": "2026-04-22T05:55:38.931599700+00:00"
+  "test_metrics": {
+    "total_pnl": -0.0,
+    "total_trades": 0,
+    "winrate": 0.0,
+    "expectancy": 0.0,
+    "max_drawdown": 0.0,
+    "sharpe_ratio": 0.0
+  }
 }

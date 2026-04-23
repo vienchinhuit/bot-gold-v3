@@ -177,6 +177,9 @@ pub struct Config {
     
     // === NO-TRADE ZONE ===
     pub no_trade_zone_pips: f64,   // Recent trade price zone
+    
+    // === CONFIRMATION ===
+    pub require_confirmation: bool, // If false, skip the one-candle confirmation to increase frequency
 }
 
 impl Default for Config {
@@ -229,6 +232,9 @@ impl Default for Config {
             
             // No-trade zone
             no_trade_zone_pips: 10.0,
+            
+            // Confirmation
+            require_confirmation: true,
         }
     }
 }
@@ -810,7 +816,7 @@ pub fn calculate_score(
     breakdown.volatility = 1;
     
     // === CONFIRMATION SCORE (0-1) ===
-    breakdown.confirmation = 1;
+    breakdown.confirmation = if cfg.require_confirmation { 1 } else { 0 };
 
     // === REVERSION RISK PENALTY ===
     breakdown.reversal_risk = 0;
@@ -1101,61 +1107,67 @@ pub fn should_trade(
     }
     
     // ============================================================
-    // CONFIRMATION: wait one additional candle to avoid entering on immediate reversal
-    // For fast M1 scalping we require the next candle to confirm direction (reduce false entries on reversal candles)
-    if direction == Direction::Long {
-        match state.pending_long_setup {
-            None => {
-                // mark current candle as pending confirmation and wait for the next candle
-                state.pending_long_setup = Some(current_candle.time);
-                // clear opposite pending
-                state.pending_short_setup = None;
-                debug!("AWAIT_CONFIRM: pending LONG at time {}", current_candle.time);
-                return ret_hold("AWAIT_CONFIRM: waiting next candle for LONG confirmation");
-            }
-            Some(pending_ts) => {
-                if current_candle.time <= pending_ts {
+    // CONFIRMATION: optional one-candle confirmation to avoid entering on immediate reversal
+    // If cfg.require_confirmation is false we skip the wait to increase trade frequency
+    if cfg.require_confirmation {
+        if direction == Direction::Long {
+            match state.pending_long_setup {
+                None => {
+                    // mark current candle as pending confirmation and wait for the next candle
+                    state.pending_long_setup = Some(current_candle.time);
+                    // clear opposite pending
+                    state.pending_short_setup = None;
+                    debug!("AWAIT_CONFIRM: pending LONG at time {}", current_candle.time);
                     return ret_hold("AWAIT_CONFIRM: waiting next candle for LONG confirmation");
                 }
-                // We're on the candle after the pending one - require bullish confirmation
-                let range = current_candle.range().max(0.0001);
-                let close_pos = (current_candle.close - current_candle.low) / range;
-                if current_candle.close > current_candle.open && close_pos > 0.5 {
-                    // confirmed
-                    state.pending_long_setup = None;
-                    debug!("CONFIRMED LONG at time {}", current_candle.time);
-                } else {
-                    // failed confirmation - clear and skip
-                    state.pending_long_setup = None;
-                    debug!("CONFIRM_FAIL LONG at time {}", current_candle.time);
-                    return ret_skip("CONFIRM_FAIL: LONG confirmation failed on next candle");
+                Some(pending_ts) => {
+                    if current_candle.time <= pending_ts {
+                        return ret_hold("AWAIT_CONFIRM: waiting next candle for LONG confirmation");
+                    }
+                    // We're on the candle after the pending one - require bullish confirmation
+                    let range = current_candle.range().max(0.0001);
+                    let close_pos = (current_candle.close - current_candle.low) / range;
+                    if current_candle.close > current_candle.open && close_pos > 0.5 {
+                        // confirmed
+                        state.pending_long_setup = None;
+                        debug!("CONFIRMED LONG at time {}", current_candle.time);
+                    } else {
+                        // failed confirmation - clear and skip
+                        state.pending_long_setup = None;
+                        debug!("CONFIRM_FAIL LONG at time {}", current_candle.time);
+                        return ret_skip("CONFIRM_FAIL: LONG confirmation failed on next candle");
+                    }
                 }
             }
-        }
-    } else if direction == Direction::Short {
-        match state.pending_short_setup {
-            None => {
-                state.pending_short_setup = Some(current_candle.time);
-                state.pending_long_setup = None;
-                debug!("AWAIT_CONFIRM: pending SHORT at time {}", current_candle.time);
-                return ret_hold("AWAIT_CONFIRM: waiting next candle for SHORT confirmation");
-            }
-            Some(pending_ts) => {
-                if current_candle.time <= pending_ts {
+        } else if direction == Direction::Short {
+            match state.pending_short_setup {
+                None => {
+                    state.pending_short_setup = Some(current_candle.time);
+                    state.pending_long_setup = None;
+                    debug!("AWAIT_CONFIRM: pending SHORT at time {}", current_candle.time);
                     return ret_hold("AWAIT_CONFIRM: waiting next candle for SHORT confirmation");
                 }
-                let range = current_candle.range().max(0.0001);
-                let close_pos = (current_candle.close - current_candle.low) / range;
-                if current_candle.close < current_candle.open && close_pos < 0.5 {
-                    state.pending_short_setup = None;
-                    debug!("CONFIRMED SHORT at time {}", current_candle.time);
-                } else {
-                    state.pending_short_setup = None;
-                    debug!("CONFIRM_FAIL SHORT at time {}", current_candle.time);
-                    return ret_skip("CONFIRM_FAIL: SHORT confirmation failed on next candle");
+                Some(pending_ts) => {
+                    if current_candle.time <= pending_ts {
+                        return ret_hold("AWAIT_CONFIRM: waiting next candle for SHORT confirmation");
+                    }
+                    let range = current_candle.range().max(0.0001);
+                    let close_pos = (current_candle.close - current_candle.low) / range;
+                    if current_candle.close < current_candle.open && close_pos < 0.5 {
+                        state.pending_short_setup = None;
+                        debug!("CONFIRMED SHORT at time {}", current_candle.time);
+                    } else {
+                        state.pending_short_setup = None;
+                        debug!("CONFIRM_FAIL SHORT at time {}", current_candle.time);
+                        return ret_skip("CONFIRM_FAIL: SHORT confirmation failed on next candle");
+                    }
                 }
             }
         }
+    } else {
+        // Confirmation disabled - clear any pending markers and proceed
+        state.pending_long_setup = None;
+        state.pending_short_setup = None;
     }
 
     // ============================================================

@@ -25,7 +25,7 @@ use strategy_new::{
     is_pullback, detect_structure,
     SwingType,
 };
-use optimizer::{OptimizerConfig, OptimizationResult, optimize_from_logs, save_optimization_result, load_trade_logs, load_optimization_result};
+use optimizer::{OptimizationResult, optimize, save_optimization_result, load_trade_logs, load_optimization_result};
 
 use log_writer::{make_strategy_row, append_strategy_log};
 
@@ -357,7 +357,7 @@ fn main() {
         rsi_sell_confirm_high: 60.0,
         rsi_buy_confirm_low: 40.0,
         rsi_buy_confirm_high: 50.0,
-        max_candle_mult: args.max_candle_mult,
+                max_candle_mult: args.max_candle_mult,
         max_wick_ratio: 0.5,
         min_score: args.min_score,
         min_confidence: args.min_confidence,
@@ -369,6 +369,7 @@ fn main() {
         pause_duration_minutes: args.pause_minutes,
         max_positions_per_direction: 10,
         no_trade_zone_pips: 100.0,
+        require_confirmation: true,
         };
 
         // Initialize Slack client early so optimizer can send updates
@@ -404,167 +405,226 @@ fn main() {
 
                 if args.auto_optimize {
         let logs = load_trade_logs(&args.strategy_log_file);
-        let base = OptimizerConfig {
-            min_score: args.min_score,
-            min_confidence: args.min_confidence,
-            sideway_threshold: args.sideway_threshold,
-            min_trend_strength: args.min_trend_strength,
-            max_pullback_pips: args.max_pullback_pips,
-            max_fomo_pips: args.max_fomo_pips,
-            max_candle_mult: args.max_candle_mult,
-            sl_mult: args.sl_mult,
-            tp_mult: args.tp_mult,
-        };
+        let base_cfg = Config {
+                    ema_fast: 20,
+                    ema_slow: 50,
+                    rsi_period: 14,
+                    atr_period: 14,
+                    sideway_ema_threshold: args.sideway_threshold,
+                    min_trend_strength: args.min_trend_strength,
+                    max_pullback_pips: args.max_pullback_pips,
+                    max_fomo_pips: args.max_fomo_pips,
+                    rsi_oversold: 30.0,
+                    rsi_overbought: 70.0,
+                    rsi_sell_confirm_low: 50.0,
+                    rsi_sell_confirm_high: 60.0,
+                    rsi_buy_confirm_low: 40.0,
+                    rsi_buy_confirm_high: 50.0,
+                    max_candle_mult: args.max_candle_mult,
+                    max_wick_ratio: 0.5,
+                    min_score: args.min_score,
+                    min_confidence: args.min_confidence,
+                    sl_mult: args.sl_mult,
+                    tp_mult: args.tp_mult,
+                    pip_value: 0.01,
+                    cooldown_after_loss: args.cooldown_candles,
+                    max_consecutive_losses: args.max_losses,
+                    pause_duration_minutes: args.pause_minutes,
+                    max_positions_per_direction: 10,
+                    no_trade_zone_pips: 100.0,
+                    require_confirmation: true,
+                };
 
         // If user requested a loose start, apply loose config regardless of logs
         if args.loose_start {
-                        let mut loose = base.clone();
-            loose.min_score = 1; // very low required score for demo
-            loose.min_confidence = 0.10; // very low confidence
-            loose.max_pullback_pips = (loose.max_pullback_pips + 25.0).min(120.0);
-            loose.max_fomo_pips = (loose.max_fomo_pips + 40.0).min(200.0);
-            loose.max_candle_mult = (loose.max_candle_mult + 2.0).min(6.0);
+                    let mut loose = base_cfg.clone();
+        loose.min_score = 0; // very low required score for demo (loose start)
+        loose.min_confidence = 0.10; // very low confidence
+        loose.max_pullback_pips = (loose.max_pullback_pips + 25.0).min(120.0);
+        loose.max_fomo_pips = (loose.max_fomo_pips + 40.0).min(200.0);
+        loose.max_candle_mult = (loose.max_candle_mult + 2.0).min(6.0);
 
 
-            let mut metrics = HashMap::new();
-            metrics.insert("note".to_string(), 1.0);
-            let result = OptimizationResult { before: base.clone(), after: loose.clone(), metrics, rationale: vec!["Loose start forced by CLI".to_string()], updated_at: Utc::now().to_rfc3339() };
+        let mut metrics = HashMap::new();
+                metrics.insert("note".to_string(), 1.0);
+                // Build a minimal BacktestResult placeholder
+                let empty_metrics = optimizer::BacktestResult { total_pnl: 0.0, total_trades: 0, winrate: 0.0, expectancy: 0.0, max_drawdown: 0.0, sharpe_ratio: 0.0 };
+                let result = OptimizationResult { best_config: loose.clone(), train_metrics: empty_metrics.clone(), test_metrics: empty_metrics.clone() };
 
-            if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
-                warn!("Failed to save loose starter optimizer result: {}", e);
-            } else {
-                info!("Loose starter optimizer config saved to {}", args.optimizer_output_file);
-            }
-
-            // Apply loose config
-            config.min_score = loose.min_score;
-            config.min_confidence = loose.min_confidence;
-            config.sideway_ema_threshold = loose.sideway_threshold;
-            config.min_trend_strength = loose.min_trend_strength;
-            config.max_pullback_pips = loose.max_pullback_pips;
-            config.max_fomo_pips = loose.max_fomo_pips;
-            config.max_candle_mult = loose.max_candle_mult;
-            config.sl_mult = loose.sl_mult;
-            config.tp_mult = loose.tp_mult;
-
-                        info!("LOOSE STARTER FORCED: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
-                config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult);
-
-            // Notify Slack about applied loose optimizer (if enabled)
-            if slack.is_enabled() {
-                let summary = format!(
-                    "Loose starter applied at startup: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
-                    config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult
-                );
-                if let Err(e) = slack.send_optimizer_update("Loose Starter Applied", &summary) {
-                    warn!("Failed to send loose optimizer update to Slack: {}", e);
+                if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
+                    warn!("Failed to save loose starter optimizer result: {}", e);
                 } else {
-                    info!("Loose optimizer update sent to Slack");
+                    info!("Loose starter optimizer config saved to {}", args.optimizer_output_file);
                 }
+
+                // Apply loose config
+                config.min_score = loose.min_score;
+                config.min_confidence = loose.min_confidence;
+                config.sideway_ema_threshold = loose.sideway_ema_threshold;
+                config.min_trend_strength = loose.min_trend_strength;
+                config.max_pullback_pips = loose.max_pullback_pips;
+                config.max_fomo_pips = loose.max_fomo_pips;
+                config.max_candle_mult = loose.max_candle_mult;
+                config.sl_mult = loose.sl_mult;
+                config.tp_mult = loose.tp_mult;
+        // Reduce confirmation requirement for loose start to increase trade frequency
+        config.require_confirmation = false;
+
+                    info!("LOOSE STARTER FORCED: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
+            config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult);
+
+        // Notify Slack about applied loose optimizer (if enabled)
+        if slack.is_enabled() {
+            let summary = format!(
+                "Loose starter applied at startup: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
+                config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult
+            );
+            if let Err(e) = slack.send_optimizer_update("Loose Starter Applied", &summary) {
+                warn!("Failed to send loose optimizer update to Slack: {}", e);
+            } else {
+                info!("Loose optimizer update sent to Slack");
             }
+        }
         }
 
 
         if logs.is_empty() && !args.loose_start {
-            // No historical logs: apply a loose starter config to create more trades initially
-            let mut loose = base.clone();
-            loose.min_score = 3;
-            loose.min_confidence = 0.30;
-            loose.max_pullback_pips = (loose.max_pullback_pips + 10.0).min(60.0);
-            loose.max_fomo_pips = (loose.max_fomo_pips + 15.0).min(80.0);
-            loose.max_candle_mult = (loose.max_candle_mult + 0.5).min(3.0);
+        // No historical logs: apply a loose starter config to create more trades initially
+        let mut loose = base_cfg.clone();
+        loose.min_score = 3;
+        loose.min_confidence = 0.30;
+        loose.max_pullback_pips = (loose.max_pullback_pips + 10.0).min(60.0);
+        loose.max_fomo_pips = (loose.max_fomo_pips + 15.0).min(80.0);
+        loose.max_candle_mult = (loose.max_candle_mult + 0.5).min(3.0);
 
-            let mut metrics = HashMap::new();
-            metrics.insert("note".to_string(), 1.0);
-            let result = OptimizationResult { before: base.clone(), after: loose.clone(), metrics, rationale: vec!["No logs - applying loose starter config".to_string()], updated_at: Utc::now().to_rfc3339() };
+        let mut metrics = HashMap::new();
+                metrics.insert("note".to_string(), 1.0);
+                let empty_metrics = optimizer::BacktestResult { total_pnl: 0.0, total_trades: 0, winrate: 0.0, expectancy: 0.0, max_drawdown: 0.0, sharpe_ratio: 0.0 };
+                let result = OptimizationResult { best_config: loose.clone(), train_metrics: empty_metrics.clone(), test_metrics: empty_metrics.clone() };
 
-            if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
-                warn!("Failed to save starter optimizer result: {}", e);
-            } else {
-                info!("Starter loose optimizer config saved to {}", args.optimizer_output_file);
-            }
-
-            // Apply loose config
-            config.min_score = loose.min_score;
-            config.min_confidence = loose.min_confidence;
-            config.sideway_ema_threshold = loose.sideway_threshold;
-            config.min_trend_strength = loose.min_trend_strength;
-            config.max_pullback_pips = loose.max_pullback_pips;
-            config.max_fomo_pips = loose.max_fomo_pips;
-            config.max_candle_mult = loose.max_candle_mult;
-            config.sl_mult = loose.sl_mult;
-            config.tp_mult = loose.tp_mult;
-
-                        info!("LOOSE STARTER APPLIED: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
-                config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult);
-
-            // Notify Slack about applied starter optimizer
-            if slack.is_enabled() {
-                let summary = format!(
-                    "Starter loose config applied: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
-                    config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult
-                );
-                if let Err(e) = slack.send_optimizer_update("Starter Loose Applied", &summary) {
-                    warn!("Failed to send starter optimizer update to Slack: {}", e);
+                if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
+                    warn!("Failed to save starter optimizer result: {}", e);
                 } else {
-                    info!("Starter optimizer update sent to Slack");
+                    info!("Starter loose optimizer config saved to {}", args.optimizer_output_file);
                 }
+
+                // Apply loose config
+                config.min_score = loose.min_score;
+                config.min_confidence = loose.min_confidence;
+                config.sideway_ema_threshold = loose.sideway_ema_threshold;
+                config.min_trend_strength = loose.min_trend_strength;
+                config.max_pullback_pips = loose.max_pullback_pips;
+                config.max_fomo_pips = loose.max_fomo_pips;
+                config.max_candle_mult = loose.max_candle_mult;
+                config.sl_mult = loose.sl_mult;
+                config.tp_mult = loose.tp_mult;
+        // When applying starter loose due to no logs, also relax confirmation to increase initial trades
+        config.require_confirmation = false;
+
+                    info!("LOOSE STARTER APPLIED: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
+            config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult);
+
+        // Notify Slack about applied starter optimizer
+        if slack.is_enabled() {
+            let summary = format!(
+                "Starter loose config applied: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
+                config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult
+            );
+            if let Err(e) = slack.send_optimizer_update("Starter Loose Applied", &summary) {
+                warn!("Failed to send starter optimizer update to Slack: {}", e);
+            } else {
+                info!("Starter optimizer update sent to Slack");
             }
+        }
         } else if !args.loose_start {
 
-            let result = optimize_from_logs(&logs, &base);
-            if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
-                warn!("Failed to save optimization result: {}", e);
+                        // Load historical candles for optimizer
+            let history_candles: Vec<Candle> = if !args.history_file.is_empty() && std::path::Path::new(&args.history_file).exists() {
+                match std::fs::read_to_string(&args.history_file) {
+                    Ok(s) => serde_json::from_str::<Vec<Candle>>(&s).unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                }
+            } else { Vec::new() };
+
+            if history_candles.is_empty() {
+                warn!("Optimizer: no historical candles found at {} - skipping optimization", args.history_file);
             } else {
-                info!("Auto-optimization completed. Result saved to {}", args.optimizer_output_file);
-            }
-                        for line in &result.rationale {
-                            info!("OPTIMIZER: {}", line);
-                        }
-                        info!("OPTIMIZER METRICS: {:?}", result.metrics);
+                let result = optimize(&history_candles, config.clone());
+                if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
+                    warn!("Failed to save optimization result: {}", e);
+                } else {
+                    info!("Auto-optimization completed. Result saved to {}", args.optimizer_output_file);
+                }
 
+                // Log train/test metrics
+                info!("OPTIMIZER TRAIN METRICS: total_pnl={:.3} trades={} winrate={:.2} expectancy={:.3} max_dd={:.3} sharpe={:.3}",
+                    result.train_metrics.total_pnl,
+                    result.train_metrics.total_trades,
+                    result.train_metrics.winrate,
+                    result.train_metrics.expectancy,
+                    result.train_metrics.max_drawdown,
+                    result.train_metrics.sharpe_ratio
+                );
 
+                info!("OPTIMIZER TEST METRICS: total_pnl={:.3} trades={} winrate={:.2} expectancy={:.3} max_dd={:.3} sharpe={:.3}",
+                    result.test_metrics.total_pnl,
+                    result.test_metrics.total_trades,
+                    result.test_metrics.winrate,
+                    result.test_metrics.expectancy,
+                    result.test_metrics.max_drawdown,
+                    result.test_metrics.sharpe_ratio
+                );
 
-            config.min_score = result.after.min_score;
-            config.min_confidence = result.after.min_confidence;
-            config.sideway_ema_threshold = result.after.sideway_threshold;
-            config.min_trend_strength = result.after.min_trend_strength;
-            config.max_pullback_pips = result.after.max_pullback_pips;
-            config.max_fomo_pips = result.after.max_fomo_pips;
-            config.max_candle_mult = result.after.max_candle_mult;
-            config.sl_mult = result.after.sl_mult;
-            config.tp_mult = result.after.tp_mult;
+                // Apply best config
+                config.min_score = result.best_config.min_score;
+                config.min_confidence = result.best_config.min_confidence;
+                config.sideway_ema_threshold = result.best_config.sideway_ema_threshold;
+                config.min_trend_strength = result.best_config.min_trend_strength;
+                config.max_pullback_pips = result.best_config.max_pullback_pips;
+                config.max_fomo_pips = result.best_config.max_fomo_pips;
+                config.max_candle_mult = result.best_config.max_candle_mult;
+                config.sl_mult = result.best_config.sl_mult;
+                config.tp_mult = result.best_config.tp_mult;
 
-            info!("OPTIMIZER APPLIED: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}",
-                config.min_score,
-                config.min_confidence,
-                config.sideway_ema_threshold,
-                config.min_trend_strength,
-                config.max_pullback_pips,
-                config.max_fomo_pips,
-                config.max_candle_mult,
-                config.sl_mult,
-                config.tp_mult
-            );
+                info!("OPTIMIZER APPLIED: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}",
+                    config.min_score,
+                    config.min_confidence,
+                    config.sideway_ema_threshold,
+                    config.min_trend_strength,
+                    config.max_pullback_pips,
+                    config.max_fomo_pips,
+                    config.max_candle_mult,
+                    config.sl_mult,
+                    config.tp_mult
+                );
 
-            let summary = format!(
-                "Applied config: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}\nMetrics: {:?}\nRationale: {}",
-                config.min_score,
-                config.min_confidence,
-                config.sideway_ema_threshold,
-                config.min_trend_strength,
-                config.max_pullback_pips,
-                config.max_fomo_pips,
-                config.max_candle_mult,
-                config.sl_mult,
-                config.tp_mult,
-                result.metrics,
-                result.rationale.join(" | ")
-            );
-            if let Err(e) = slack.send_optimizer_update("Optimizer Applied", &summary) {
-                warn!("Failed to send optimizer update to Slack: {}", e);
-            } else {
-                info!("Optimizer update sent to Slack");
+                let summary = format!(
+                    "Applied config: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}\nTrainMetrics: total_pnl={:.3} trades={} winrate={:.2} expectancy={:.3} max_dd={:.3}\nTestMetrics: total_pnl={:.3} trades={} winrate={:.2} expectancy={:.3} max_dd={:.3}",
+                    config.min_score,
+                    config.min_confidence,
+                    config.sideway_ema_threshold,
+                    config.min_trend_strength,
+                    config.max_pullback_pips,
+                    config.max_fomo_pips,
+                    config.max_candle_mult,
+                    config.sl_mult,
+                    config.tp_mult,
+                    result.train_metrics.total_pnl,
+                    result.train_metrics.total_trades,
+                    result.train_metrics.winrate,
+                    result.train_metrics.expectancy,
+                    result.train_metrics.max_drawdown,
+                    result.test_metrics.total_pnl,
+                    result.test_metrics.total_trades,
+                    result.test_metrics.winrate,
+                    result.test_metrics.expectancy,
+                    result.test_metrics.max_drawdown,
+                );
+                if let Err(e) = slack.send_optimizer_update("Optimizer Applied", &summary) {
+                    warn!("Failed to send optimizer update to Slack: {}", e);
+                } else {
+                    info!("Optimizer update sent to Slack");
+                }
             }
         }
     }
@@ -993,29 +1053,29 @@ fn main() {
                                 if args.auto_reload_optimized_config {
                                     let now = Utc::now();
                                     if last_heartbeat_time.map_or(true, |t| (now - t).num_seconds() >= args.optimizer_reload_sec as i64) {
-                                        if let Some(result) = load_optimization_result(&args.optimizer_output_file) {
-                                            config.min_score = result.after.min_score;
-                                            config.min_confidence = result.after.min_confidence;
-                                            config.sideway_ema_threshold = result.after.sideway_threshold;
-                                            config.min_trend_strength = result.after.min_trend_strength;
-                                            config.max_pullback_pips = result.after.max_pullback_pips;
-                                            config.max_fomo_pips = result.after.max_fomo_pips;
-                                            config.max_candle_mult = result.after.max_candle_mult;
-                                            config.sl_mult = result.after.sl_mult;
-                                            config.tp_mult = result.after.tp_mult;
-                                            info!("CONFIG RELOADED FROM OPTIMIZER: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}",
-                                                config.min_score,
-                                                config.min_confidence,
-                                                config.sideway_ema_threshold,
-                                                config.min_trend_strength,
-                                                config.max_pullback_pips,
-                                                config.max_fomo_pips,
-                                                config.max_candle_mult,
-                                                config.sl_mult,
-                                                config.tp_mult);
-                                        }
-                                        last_heartbeat_time = Some(now);
-                                    }
+                                                                            if let Some(result) = load_optimization_result(&args.optimizer_output_file) {
+                                                                                config.min_score = result.best_config.min_score;
+                                                                                config.min_confidence = result.best_config.min_confidence;
+                                                                                config.sideway_ema_threshold = result.best_config.sideway_ema_threshold;
+                                                                                config.min_trend_strength = result.best_config.min_trend_strength;
+                                                                                config.max_pullback_pips = result.best_config.max_pullback_pips;
+                                                                                config.max_fomo_pips = result.best_config.max_fomo_pips;
+                                                                                config.max_candle_mult = result.best_config.max_candle_mult;
+                                                                                config.sl_mult = result.best_config.sl_mult;
+                                                                                config.tp_mult = result.best_config.tp_mult;
+                                                                                info!("CONFIG RELOADED FROM OPTIMIZER: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}",
+                                                                                    config.min_score,
+                                                                                    config.min_confidence,
+                                                                                    config.sideway_ema_threshold,
+                                                                                    config.min_trend_strength,
+                                                                                    config.max_pullback_pips,
+                                                                                    config.max_fomo_pips,
+                                                                                    config.max_candle_mult,
+                                                                                    config.sl_mult,
+                                                                                    config.tp_mult);
+                                                                            }
+                                                                            last_heartbeat_time = Some(now);
+                                                                        }
                                 }
 
 
@@ -1476,56 +1536,66 @@ fn main() {
                         // If auto-optimization enabled, run a quick incremental optimizer after each close
                         if args.auto_optimize {
                             let logs = load_trade_logs(&args.strategy_log_file);
-                            let base_opt = if let Some(res) = load_optimization_result(&args.optimizer_output_file) {
-                                res.after
+                                                        // Determine base config for incremental optimizer (prefer last saved best_config)
+                            let base_cfg: Config = if let Some(res) = load_optimization_result(&args.optimizer_output_file) {
+                                res.best_config
                             } else {
-                                OptimizerConfig {
-                                    min_score: args.min_score,
-                                    min_confidence: args.min_confidence,
-                                    sideway_threshold: args.sideway_threshold,
-                                    min_trend_strength: args.min_trend_strength,
-                                    max_pullback_pips: args.max_pullback_pips,
-                                    max_fomo_pips: args.max_fomo_pips,
-                                    max_candle_mult: args.max_candle_mult,
-                                    sl_mult: args.sl_mult,
-                                    tp_mult: args.tp_mult,
-                                }
+                                config.clone()
                             };
 
-                            // Run optimizer (lightweight) and apply result
-                            let result = optimize_from_logs(&logs, &base_opt);
-                                                        if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
-                                warn!("Failed to save incremental optimization result: {}", e);
-                            } else {
-                                info!("Incremental optimizer saved to {}", args.optimizer_output_file);
-                                // Notify Slack about incremental optimizer
-                                if slack.is_enabled() {
-                                    let summary = format!(
-                                        "Incremental optimizer applied: min_score={} min_conf={:.2} pullback={} fomo={}",
-                                        result.after.min_score, result.after.min_confidence, result.after.max_pullback_pips, result.after.max_fomo_pips
-                                    );
-                                    if let Err(e) = slack.send_optimizer_update("Incremental Optimizer Applied", &summary) {
-                                        warn!("Failed to send incremental optimizer update to Slack: {}", e);
-                                    } else {
-                                        info!("Incremental optimizer update sent to Slack");
-                                    }
-                                }
-                            }
+                            // Load history candles for optimizer (if available)
+                                                        let mut history_candles: Vec<Candle> = Vec::new();
+                                                        if !args.history_file.is_empty() && std::path::Path::new(&args.history_file).exists() {
+                                                            if let Ok(s) = std::fs::read_to_string(&args.history_file) {
+                                                                history_candles = serde_json::from_str::<Vec<Candle>>(&s).unwrap_or_default();
+                                                            }
+                                                        }
 
-                            // Apply new config gradually
+                                                        // If no file-based history, fallback to in-memory state.candles (if enough data)
+                                                        if history_candles.is_empty() {
+                                                            if state.candles.len() >= 50 {
+                                                                history_candles = state.candles.iter().copied().collect();
+                                                                info!("Incremental optimizer: using in-memory candle history ({} candles)", history_candles.len());
+                                                            } else {
+                                                                warn!("Incremental optimizer: no historical candles found at {} and in-memory history < 50 - skipping incremental optimization", args.history_file);
+                                                            }
+                                                        }
 
-                            config.min_score = result.after.min_score;
-                            config.min_confidence = result.after.min_confidence;
-                            config.sideway_ema_threshold = result.after.sideway_threshold;
-                            config.min_trend_strength = result.after.min_trend_strength;
-                            config.max_pullback_pips = result.after.max_pullback_pips;
-                            config.max_fomo_pips = result.after.max_fomo_pips;
-                            config.max_candle_mult = result.after.max_candle_mult;
-                            config.sl_mult = result.after.sl_mult;
-                            config.tp_mult = result.after.tp_mult;
+                                                        if !history_candles.is_empty() {
+                                                            let result = optimize(&history_candles, base_cfg.clone());
+                                                            if let Err(e) = save_optimization_result(&args.optimizer_output_file, &result) {
+                                                                warn!("Failed to save incremental optimization result: {}", e);
+                                                            } else {
+                                                                info!("Incremental optimizer saved to {}", args.optimizer_output_file);
+                                                                // Notify Slack about incremental optimizer
+                                                                if slack.is_enabled() {
+                                                                    let summary = format!(
+                                                                        "Incremental optimizer applied: min_score={} min_conf={:.2} pullback={} fomo={}",
+                                                                        result.best_config.min_score, result.best_config.min_confidence, result.best_config.max_pullback_pips, result.best_config.max_fomo_pips
+                                                                    );
+                                                                    if let Err(e) = slack.send_optimizer_update("Incremental Optimizer Applied", &summary) {
+                                                                        warn!("Failed to send incremental optimizer update to Slack: {}", e);
+                                                                    } else {
+                                                                        info!("Incremental optimizer update sent to Slack");
+                                                                    }
+                                                                }
+                                                            }
 
-                            info!("INCREMENTAL OPTIMIZER APPLIED: min_score={} min_conf={:.2} pullback={:.1} fomo={:.1}",
-                                config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips);
+                                                            // Apply new config gradually
+                                                            config.min_score = result.best_config.min_score;
+                                                            config.min_confidence = result.best_config.min_confidence;
+                                                            config.sideway_ema_threshold = result.best_config.sideway_ema_threshold;
+                                                            config.min_trend_strength = result.best_config.min_trend_strength;
+                                                            config.max_pullback_pips = result.best_config.max_pullback_pips;
+                                                            config.max_fomo_pips = result.best_config.max_fomo_pips;
+                                                            config.max_candle_mult = result.best_config.max_candle_mult;
+                                                            config.sl_mult = result.best_config.sl_mult;
+                                                            config.tp_mult = result.best_config.tp_mult;
+
+                                                            info!("INCREMENTAL OPTIMIZER APPLIED: min_score={} min_conf={:.2} pullback={:.1} fomo={:.1}",
+                                                                config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips);
+                                                        }
+
                         }
                     }
 
