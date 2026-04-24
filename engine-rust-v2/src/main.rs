@@ -473,18 +473,30 @@ fn main() {
                     info!("LOOSE STARTER FORCED: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
             config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult);
 
-        // Notify Slack about applied loose optimizer (if enabled)
+                // Notify Slack about applied loose optimizer (if enabled)
         if slack.is_enabled() {
             let summary = format!(
                 "Loose starter applied at startup: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
                 config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult
             );
-            if let Err(e) = slack.send_optimizer_update("Loose Starter Applied", &summary) {
+            // Build list of changed params (compare base_cfg -> loose)
+            let mut changes: Vec<(String,String,String)> = Vec::new();
+            if base_cfg.min_score != loose.min_score { changes.push(("min_score".to_string(), base_cfg.min_score.to_string(), loose.min_score.to_string())); }
+            if (base_cfg.min_confidence - loose.min_confidence).abs() > std::f64::EPSILON { changes.push(("min_confidence".to_string(), format!("{:.2}", base_cfg.min_confidence), format!("{:.2}", loose.min_confidence))); }
+            if (base_cfg.max_pullback_pips - loose.max_pullback_pips).abs() > std::f64::EPSILON { changes.push(("max_pullback_pips".to_string(), format!("{:.1}", base_cfg.max_pullback_pips), format!("{:.1}", loose.max_pullback_pips))); }
+            if (base_cfg.max_fomo_pips - loose.max_fomo_pips).abs() > std::f64::EPSILON { changes.push(("max_fomo_pips".to_string(), format!("{:.1}", base_cfg.max_fomo_pips), format!("{:.1}", loose.max_fomo_pips))); }
+            if (base_cfg.max_candle_mult - loose.max_candle_mult).abs() > std::f64::EPSILON { changes.push(("max_candle_mult".to_string(), format!("{:.2}", base_cfg.max_candle_mult), format!("{:.2}", loose.max_candle_mult))); }
+            if (base_cfg.sl_mult - loose.sl_mult).abs() > std::f64::EPSILON { changes.push(("sl_mult".to_string(), format!("{:.2}", base_cfg.sl_mult), format!("{:.2}", loose.sl_mult))); }
+            if (base_cfg.tp_mult - loose.tp_mult).abs() > std::f64::EPSILON { changes.push(("tp_mult".to_string(), format!("{:.2}", base_cfg.tp_mult), format!("{:.2}", loose.tp_mult))); }
+            if base_cfg.require_confirmation != loose.require_confirmation { changes.push(("require_confirmation".to_string(), format!("{}", base_cfg.require_confirmation), format!("{}", loose.require_confirmation))); }
+
+            if let Err(e) = slack.send_optimizer_update("Loose Starter Applied", &summary, Some(changes)) {
                 warn!("Failed to send loose optimizer update to Slack: {}", e);
             } else {
                 info!("Loose optimizer update sent to Slack");
             }
         }
+
         }
 
 
@@ -524,18 +536,30 @@ fn main() {
                     info!("LOOSE STARTER APPLIED: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
             config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult);
 
-        // Notify Slack about applied starter optimizer
+                // Notify Slack about applied starter optimizer
         if slack.is_enabled() {
             let summary = format!(
                 "Starter loose config applied: min_score={} min_conf={:.2} pullback={} fomo={} candle_mult={:.2}",
                 config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips, config.max_candle_mult
             );
-            if let Err(e) = slack.send_optimizer_update("Starter Loose Applied", &summary) {
+            // Build list of changed params (compare base_cfg -> loose)
+            let mut changes: Vec<(String,String,String)> = Vec::new();
+            if base_cfg.min_score != loose.min_score { changes.push(("min_score".to_string(), base_cfg.min_score.to_string(), loose.min_score.to_string())); }
+            if (base_cfg.min_confidence - loose.min_confidence).abs() > std::f64::EPSILON { changes.push(("min_confidence".to_string(), format!("{:.2}", base_cfg.min_confidence), format!("{:.2}", loose.min_confidence))); }
+            if (base_cfg.max_pullback_pips - loose.max_pullback_pips).abs() > std::f64::EPSILON { changes.push(("max_pullback_pips".to_string(), format!("{:.1}", base_cfg.max_pullback_pips), format!("{:.1}", loose.max_pullback_pips))); }
+            if (base_cfg.max_fomo_pips - loose.max_fomo_pips).abs() > std::f64::EPSILON { changes.push(("max_fomo_pips".to_string(), format!("{:.1}", base_cfg.max_fomo_pips), format!("{:.1}", loose.max_fomo_pips))); }
+            if (base_cfg.max_candle_mult - loose.max_candle_mult).abs() > std::f64::EPSILON { changes.push(("max_candle_mult".to_string(), format!("{:.2}", base_cfg.max_candle_mult), format!("{:.2}", loose.max_candle_mult))); }
+            if (base_cfg.sl_mult - loose.sl_mult).abs() > std::f64::EPSILON { changes.push(("sl_mult".to_string(), format!("{:.2}", base_cfg.sl_mult), format!("{:.2}", loose.sl_mult))); }
+            if (base_cfg.tp_mult - loose.tp_mult).abs() > std::f64::EPSILON { changes.push(("tp_mult".to_string(), format!("{:.2}", base_cfg.tp_mult), format!("{:.2}", loose.tp_mult))); }
+            if base_cfg.require_confirmation != loose.require_confirmation { changes.push(("require_confirmation".to_string(), format!("{}", base_cfg.require_confirmation), format!("{}", loose.require_confirmation))); }
+
+            if let Err(e) = slack.send_optimizer_update("Starter Loose Applied", &summary, Some(changes)) {
                 warn!("Failed to send starter optimizer update to Slack: {}", e);
             } else {
                 info!("Starter optimizer update sent to Slack");
             }
         }
+
         } else if !args.loose_start {
 
                         // Load historical candles for optimizer
@@ -575,7 +599,8 @@ fn main() {
                     result.test_metrics.sharpe_ratio
                 );
 
-                // Apply best config
+                                // Apply best config
+                let old_cfg = config.clone();
                 config.min_score = result.best_config.min_score;
                 config.min_confidence = result.best_config.min_confidence;
                 config.sideway_ema_threshold = result.best_config.sideway_ema_threshold;
@@ -620,11 +645,26 @@ fn main() {
                     result.test_metrics.expectancy,
                     result.test_metrics.max_drawdown,
                 );
-                if let Err(e) = slack.send_optimizer_update("Optimizer Applied", &summary) {
-                    warn!("Failed to send optimizer update to Slack: {}", e);
-                } else {
-                    info!("Optimizer update sent to Slack");
+                if slack.is_enabled() {
+                    // Build list of changed params (compare old_cfg -> result.best_config)
+                    let mut changes: Vec<(String,String,String)> = Vec::new();
+                    if old_cfg.min_score != result.best_config.min_score { changes.push(("min_score".to_string(), old_cfg.min_score.to_string(), result.best_config.min_score.to_string())); }
+                    if (old_cfg.min_confidence - result.best_config.min_confidence).abs() > std::f64::EPSILON { changes.push(("min_confidence".to_string(), format!("{:.2}", old_cfg.min_confidence), format!("{:.2}", result.best_config.min_confidence))); }
+                    if (old_cfg.sideway_ema_threshold - result.best_config.sideway_ema_threshold).abs() > std::f64::EPSILON { changes.push(("sideway_ema_threshold".to_string(), format!("{:.3}", old_cfg.sideway_ema_threshold), format!("{:.3}", result.best_config.sideway_ema_threshold))); }
+                    if (old_cfg.min_trend_strength - result.best_config.min_trend_strength).abs() > std::f64::EPSILON { changes.push(("min_trend_strength".to_string(), format!("{:.3}", old_cfg.min_trend_strength), format!("{:.3}", result.best_config.min_trend_strength))); }
+                    if (old_cfg.max_pullback_pips - result.best_config.max_pullback_pips).abs() > std::f64::EPSILON { changes.push(("max_pullback_pips".to_string(), format!("{:.1}", old_cfg.max_pullback_pips), format!("{:.1}", result.best_config.max_pullback_pips))); }
+                    if (old_cfg.max_fomo_pips - result.best_config.max_fomo_pips).abs() > std::f64::EPSILON { changes.push(("max_fomo_pips".to_string(), format!("{:.1}", old_cfg.max_fomo_pips), format!("{:.1}", result.best_config.max_fomo_pips))); }
+                    if (old_cfg.max_candle_mult - result.best_config.max_candle_mult).abs() > std::f64::EPSILON { changes.push(("max_candle_mult".to_string(), format!("{:.2}", old_cfg.max_candle_mult), format!("{:.2}", result.best_config.max_candle_mult))); }
+                    if (old_cfg.sl_mult - result.best_config.sl_mult).abs() > std::f64::EPSILON { changes.push(("sl_mult".to_string(), format!("{:.2}", old_cfg.sl_mult), format!("{:.2}", result.best_config.sl_mult))); }
+                    if (old_cfg.tp_mult - result.best_config.tp_mult).abs() > std::f64::EPSILON { changes.push(("tp_mult".to_string(), format!("{:.2}", old_cfg.tp_mult), format!("{:.2}", result.best_config.tp_mult))); }
+
+                    if let Err(e) = slack.send_optimizer_update("Optimizer Applied", &summary, Some(changes)) {
+                        warn!("Failed to send optimizer update to Slack: {}", e);
+                    } else {
+                        info!("Optimizer update sent to Slack");
+                    }
                 }
+
             }
         }
     }
@@ -1568,17 +1608,25 @@ fn main() {
                                                             } else {
                                                                 info!("Incremental optimizer saved to {}", args.optimizer_output_file);
                                                                 // Notify Slack about incremental optimizer
-                                                                if slack.is_enabled() {
+                                                                                                                                if slack.is_enabled() {
                                                                     let summary = format!(
                                                                         "Incremental optimizer applied: min_score={} min_conf={:.2} pullback={} fomo={}",
                                                                         result.best_config.min_score, result.best_config.min_confidence, result.best_config.max_pullback_pips, result.best_config.max_fomo_pips
                                                                     );
-                                                                    if let Err(e) = slack.send_optimizer_update("Incremental Optimizer Applied", &summary) {
+                                                                    // Build list of changed params (compare current config -> result.best_config)
+                                                                    let mut changes: Vec<(String,String,String)> = Vec::new();
+                                                                    if config.min_score != result.best_config.min_score { changes.push(("min_score".to_string(), config.min_score.to_string(), result.best_config.min_score.to_string())); }
+                                                                    if (config.min_confidence - result.best_config.min_confidence).abs() > std::f64::EPSILON { changes.push(("min_confidence".to_string(), format!("{:.2}", config.min_confidence), format!("{:.2}", result.best_config.min_confidence))); }
+                                                                    if (config.max_pullback_pips - result.best_config.max_pullback_pips).abs() > std::f64::EPSILON { changes.push(("max_pullback_pips".to_string(), format!("{:.1}", config.max_pullback_pips), format!("{:.1}", result.best_config.max_pullback_pips))); }
+                                                                    if (config.max_fomo_pips - result.best_config.max_fomo_pips).abs() > std::f64::EPSILON { changes.push(("max_fomo_pips".to_string(), format!("{:.1}", config.max_fomo_pips), format!("{:.1}", result.best_config.max_fomo_pips))); }
+
+                                                                    if let Err(e) = slack.send_optimizer_update("Incremental Optimizer Applied", &summary, Some(changes)) {
                                                                         warn!("Failed to send incremental optimizer update to Slack: {}", e);
                                                                     } else {
                                                                         info!("Incremental optimizer update sent to Slack");
                                                                     }
                                                                 }
+
                                                             }
 
                                                             // Apply new config gradually

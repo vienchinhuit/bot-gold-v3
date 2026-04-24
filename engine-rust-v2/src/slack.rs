@@ -380,16 +380,28 @@ impl SlackClient {
     }
 
     /// Send optimizer update notification
-    pub fn send_optimizer_update(&self, title: &str, result_text: &str) -> Result<(), String> {
+    ///
+    /// `changes` is an optional list of (parameter, old_value, new_value) tuples which will be
+    /// included as Slack attachment fields so recipients can see exactly which parameters changed.
+    pub fn send_optimizer_update(&self, title: &str, result_text: &str, changes: Option<Vec<(String,String,String)>>) -> Result<(), String> {
         if !self.enabled.load(Ordering::SeqCst) {
             return Ok(());
+        }
+
+        // Build fields from changes if provided
+        let mut fields: Vec<SlackField> = Vec::new();
+        if let Some(ch) = changes {
+            for (param, old, new) in ch {
+                let val = format!("{} -> {}", old, new);
+                fields.push(SlackField { title: param, value: val, short: true });
+            }
         }
 
         let attachment = SlackAttachment {
             color: "#2E86FF".to_string(),
             title: format!(":gear: {}", title),
             text: result_text.to_string(),
-            fields: vec![],
+            fields,
             footer: "GOLD Scalping Bot v2.0".to_string(),
             ts: chrono::Utc::now().timestamp(),
         };

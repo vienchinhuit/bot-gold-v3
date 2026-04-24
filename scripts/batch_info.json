@@ -8,8 +8,8 @@
   "2100": {
     "pnl_target": 50.0,
     "tickets": [],
-    "closed_count": 10,
-    "closed_pnl": 560.0
+    "closed_count": 5,
+    "closed_pnl": 283.5
   },
   "2200": {
     "pnl_target": 10.2,
