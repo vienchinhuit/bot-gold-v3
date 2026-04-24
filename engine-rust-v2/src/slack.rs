@@ -1,6 +1,6 @@
 // ============================================================
 // SLACK NOTIFICATION MODULE
-// ============================================================aa
+// ============================================================a
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +10,8 @@ use log::warn;
 /// Slack message payload
 #[derive(Debug, Serialize)]
 struct SlackPayload {
-    channel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
     username: String,
     icon_emoji: String,
     attachments: Vec<SlackAttachment>,
@@ -448,7 +449,17 @@ impl SlackClient {
             return Err("Slack webhook URL not configured".to_string());
         }
 
-        let channel = self.get_channel();
+        let raw_channel = self.get_channel();
+        // Only include channel override if it looks like a channel/user identifier
+        // (starts with '#' or '@'). Otherwise omit and let the webhook's default channel be used.
+        let channel = if raw_channel.trim().is_empty() {
+            None
+        } else if raw_channel.starts_with('#') || raw_channel.starts_with('@') {
+            Some(raw_channel)
+        } else {
+            // Do not force non-prefixed channel names — omit to avoid webhook rejection
+            None
+        };
 
         let payload = SlackPayload {
             channel,
