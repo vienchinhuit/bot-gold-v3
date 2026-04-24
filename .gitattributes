@@ -1,0 +1,39 @@
+# Enforce consistent line endings across platforms
+# - Use LF for source code and data files that should keep Unix-style endings
+# - Use CRLF for PowerShell scripts on Windows (optional)
+
+# Auto-detect text files and normalize in the repository
+* text=auto
+
+# Explicit rules for common source files (prefer LF)
+*.rs     text eol=lf
+*.c      text eol=lf
+*.cpp    text eol=lf
+*.h      text eol=lf
+*.py     text eol=lf
+*.sh     text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+*.toml   text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.jsonl  text eol=lf
+*.html   text eol=lf
+*.css    text eol=lf
+*.js     text eol=lf
+*.ts     text eol=lf
+
+# Keep CRLF for PowerShell scripts on Windows (optional)
+*.ps1    text eol=crlf
+
+# Binary files
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.pdf    binary
+
+# Prevent normalization for these (keep as-is)
+*.lock   -text
+
+# End of .gitattributes
