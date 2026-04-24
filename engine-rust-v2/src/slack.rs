@@ -1,10 +1,11 @@
 // ============================================================
 // SLACK NOTIFICATION MODULE
-// ============================================================
+// ============================================================aa
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use log::warn;
 
 /// Slack message payload
 #[derive(Debug, Serialize)]
@@ -67,8 +68,16 @@ impl SlackClient {
             .build()
             .expect("Failed to create HTTP client");
 
+        // If enabled is requested but webhook is empty, disable and warn to avoid runtime errors
+        let actual_enabled = if enabled && webhook_url.trim().is_empty() {
+            warn!("Slack enabled but webhook URL is empty -> disabling Slack client");
+            false
+        } else {
+            enabled
+        };
+
         Self {
-            enabled: Arc::new(AtomicBool::new(enabled)),
+            enabled: Arc::new(AtomicBool::new(actual_enabled)),
             webhook_url,
             channel: Arc::new(std::sync::RwLock::new(channel)),
             client,
@@ -451,12 +460,19 @@ impl SlackClient {
         let json = serde_json::to_string(&payload)
             .map_err(|e| format!("Failed to serialize payload: {}", e))?;
 
-        self.client
+        let resp = self.client
             .post(&self.webhook_url)
             .header("Content-Type", "application/json")
             .body(json)
             .send()
             .map_err(|e| format!("Failed to send to Slack: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            // Try to read body for more info, but don't fail if reading fails
+            let body = resp.text().unwrap_or_else(|_| "<failed to read response body>".to_string());
+            return Err(format!("Slack returned error status {}: {}", status, body));
+        }
 
         Ok(())
     }
