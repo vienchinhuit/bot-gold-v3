@@ -29,12 +29,19 @@ SLACK_NOTIFY_PORT = 5557  # Port de gui close notifications den Rust engine (0 =
 
 
 class SlackNotifier:
-    """"Gui notification qua ZMQ den Rust engine de forward qua Slack."""
+    """Gui notification qua ZMQ den Rust engine de forward qua Slack.
+
+    Notes:
+    - ZMQ sockets are not thread-safe. We protect send with a lock so send_close_notify
+      can be called from background threads safely.
+    - If PUB send fails we fall back to direct Slack webhook when available.
+    """
     
     def __init__(self, port=5557):
         self.port = port
         self.context = None
         self.socket = None
+        self._send_lock = threading.Lock()
         if port > 0:
             try:
                 self.context = zmq.Context()
@@ -67,12 +74,14 @@ class SlackNotifier:
         # If we have a PUB socket, publish via ZMQ (preferred)
         if self.socket:
             try:
-                self.socket.send_string(msg)
+                with self._send_lock:
+                    self.socket.send_string(msg)
                 reason_label = "TP" if reason == "TP" else ("SL" if reason == "SL" else ("BATCH" if reason == "BATCH" else "CLOSE"))
                 print(f"  [SLACK] Notified #{ticket} {direction} {volume} lots @{price} P&L=${profit:+.2f} [{reason_label}]")
                 return
             except Exception as e:
                 print(f"  [SLACK] Failed to send ZMQ notify: {e}")
+                # Continue to webhook fallback if configured
 
         # Fallback: send directly to Slack webhook if provided via environment variable
         webhook = os.environ.get('SLACK_WEBHOOK', '').strip()
@@ -99,9 +108,15 @@ class SlackNotifier:
     
     def close(self):
         if self.socket:
-            self.socket.close()
+            try:
+                self.socket.close()
+            except Exception:
+                pass
         if self.context:
-            self.context.term()
+            try:
+                self.context.term()
+            except Exception:
+                pass
 
 
 STOP_LOSS = 0  # Dat >0 de tu dong khi lo (VD: 10 = dong khi lo $10), dat 0 de tat
