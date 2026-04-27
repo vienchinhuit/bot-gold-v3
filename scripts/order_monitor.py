@@ -204,6 +204,9 @@ def get_position_history_reason(client, ticket):
     """Attempt to retrieve close reason and PnL for a ticket via python_bridge (OrderClient).
     Falls back to local MetaTrader5 history if python_bridge not responding or not available.
     Returns dict with keys: reason, profit, price, volume or None.
+
+    NOTE: For accurate realized PnL we aggregate all DEAL_ENTRY_OUT-type deals for the
+    given position (handles partial closes) and return the summed profit.
     """
     # Try python_bridge first via OrderClient
     try:
@@ -220,6 +223,7 @@ def get_position_history_reason(client, ticket):
         return None
 
     try:
+        # Use a reasonable history window (7 days) as before
         end_time = time.time() + 60
         start_time = end_time - 7 * 24 * 3600
         deals = mt5.history_deals_get(start_time, end_time)
@@ -230,16 +234,40 @@ def get_position_history_reason(client, ticket):
         if not matched:
             return None
 
+        # Sort by time ascending
         matched.sort(key=lambda d: getattr(d, "time", 0))
-        for deal in reversed(matched):
+
+        # Aggregate all DEAL_ENTRY_OUT (and DEAL_ENTRY_OUT_BY) deals to compute realized PnL
+        out_flags = (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_OUT_BY", None))
+        total_profit = 0.0
+        total_volume = 0.0
+        last_price = None
+        last_reason = None
+        found_out = False
+
+        for deal in matched:
             entry = getattr(deal, "entry", None)
-            if entry in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_OUT_BY", None)):
-                return {
-                    'reason': map_reason_from_deal_reason(getattr(deal, "reason", None)),
-                    'profit': float(getattr(deal, "profit", 0.0) or 0.0),
-                    'price': float(getattr(deal, "price", 0.0) or 0.0),
-                    'volume': float(getattr(deal, "volume", 0.0) or 0.0),
-                }
+            if entry in out_flags:
+                found_out = True
+                profit_val = float(getattr(deal, "profit", 0.0) or 0.0)
+                vol_val = float(getattr(deal, "volume", 0.0) or 0.0)
+                price_val = float(getattr(deal, "price", 0.0) or 0.0)
+                reason_val = getattr(deal, "reason", None)
+
+                total_profit += profit_val
+                total_volume += vol_val
+                last_price = price_val if price_val else last_price
+                last_reason = reason_val if reason_val is not None else last_reason
+
+        if not found_out:
+            return None
+
+        return {
+            'reason': map_reason_from_deal_reason(last_reason),
+            'profit': float(total_profit),
+            'price': float(last_price or 0.0),
+            'volume': float(total_volume),
+        }
     except Exception:
         return None
 
