@@ -289,6 +289,27 @@ def get_position_history_reason(client, ticket):
     return None
 
 
+def fetch_close_info(client, ticket, timeout=4, poll_interval=0.5):
+    """Poll for close info (history) until available or timeout.
+
+    Tries python_bridge POSITION_GET and MT5 history repeatedly until a close
+    deal is found or timeout expires. Returns the same dict shape as
+    get_position_history_reason when successful, otherwise None.
+    """
+    start = time.time()
+    last = None
+    while time.time() - start < timeout:
+        try:
+            info = get_position_history_reason(client, ticket)
+            if info:
+                return info
+            last = info
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+    return last
+
+
 def get_position_detail(client, ticket):
     """Query MT5 for position details including profit info.
     
@@ -463,7 +484,7 @@ def main():
                 print(f"\n!!! DETECTED {len(missing_tickets)} MISSING POSITION(S):")
                 for ticket in sorted(missing_tickets):
                     snapshot = known_positions.get(ticket, {})
-                    hist = get_position_history_reason(client, ticket)
+                    hist = fetch_close_info(client, ticket, timeout=4, poll_interval=0.5)
                     reason = hist.get('reason') if hist else None
                     profit = hist.get('profit') if hist and hist.get('profit') is not None else float(snapshot.get('profit', 0) or 0)
                     price = hist.get('price') if hist and hist.get('price') is not None else float(snapshot.get('price_open', 0) or 0)
@@ -583,7 +604,7 @@ def main():
                             def deferred_close_notify(client_ref, slack_ref, ticket, snapshot, reason_hint="MANUAL", delay=1.5):
                                 try:
                                     time.sleep(delay)
-                                    hist = get_position_history_reason(client_ref, ticket)
+                                    hist = fetch_close_info(client_ref, ticket, timeout=4, poll_interval=0.5)
                                     if hist:
                                         profit = hist.get('profit', float(snapshot.get('profit', 0) or 0))
                                         price = hist.get('price', float(snapshot.get('price_open', 0) or 0))
@@ -643,7 +664,7 @@ def main():
                             def deferred_close_notify(client_ref, slack_ref, ticket, snapshot, reason_hint="SL", delay=1.5):
                                 try:
                                     time.sleep(delay)
-                                    hist = get_position_history_reason(client_ref, ticket)
+                                    hist = fetch_close_info(client_ref, ticket, timeout=4, poll_interval=0.5)
                                     if hist:
                                         profit = hist.get('profit', float(snapshot.get('profit', 0) or 0))
                                         price = hist.get('price', float(snapshot.get('price_open', 0) or 0))
@@ -710,7 +731,7 @@ def main():
                                 def deferred_close_notify(client_ref, slack_ref, ticket, snapshot, reason_hint="BATCH", delay=1.5):
                                     try:
                                         time.sleep(delay)
-                                        hist = get_position_history_reason(client_ref, ticket)
+                                        hist = fetch_close_info(client_ref, ticket, timeout=4, poll_interval=0.5)
                                         if hist:
                                             profit = hist.get('profit', float(snapshot.get('profit', 0) or 0))
                                             price = hist.get('price', float(snapshot.get('price_open', 0) or 0))
