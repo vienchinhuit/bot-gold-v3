@@ -208,6 +208,30 @@ class OrderWorker:
 
             elif msg_type == MessageType.ORDER_INFO.value:
                 return self._handle_order_info(data)
+            elif msg_type == "POSITION_GET":
+                # Return last closing deal info for a given ticket (useful for external monitors)
+                try:
+                    ticket = None
+                    if isinstance(data, dict):
+                        ticket = int(data.get('ticket', 0)) if data.get('ticket') else None
+                    else:
+                        ticket = int(data)
+                except Exception:
+                    ticket = None
+
+                if not ticket:
+                    return json.dumps({"success": False, "error": "No ticket provided"})
+
+                self._order_logger.info(f"Processing POSITION_GET for ticket={ticket}")
+                try:
+                    res = self.mt5.get_last_close_for_position(ticket)
+                    if res:
+                        return json.dumps({"success": True, "data": res})
+                    else:
+                        return json.dumps({"success": False, "error": "No deal found"})
+                except Exception as e:
+                    self._order_logger.error(f"POSITION_GET error: {e}")
+                    return json.dumps({"success": False, "error": str(e)})
             else:
                 self._order_logger.warning(f"Unknown message type: {msg_type}")
                 return json.dumps({"success": False, "error": f"Unknown message type: {msg_type}"})

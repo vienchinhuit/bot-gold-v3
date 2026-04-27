@@ -552,6 +552,54 @@ class MT5Connector:
             })
         
         return result
+
+    def get_last_close_for_position(self, ticket: int, lookback_days: int = 7) -> Optional[Dict[str, Any]]:
+        """Return the last deal that closed the given position ticket.
+
+        Scans MT5 history deals for the given position id and returns a dict with
+        keys: reason, profit, price, volume, time. Returns None if not found.
+        """
+        try:
+            end_time = time.time()
+            start_time = end_time - lookback_days * 24 * 3600
+            deals = mt5.history_deals_get(start_time, end_time)
+            if not deals:
+                return None
+
+            # Find deals matching position id (some brokers use 'position' or 'position_id')
+            matched = [d for d in deals if getattr(d, 'position_id', None) == ticket or getattr(d, 'position', None) == ticket]
+            if not matched:
+                return None
+
+            # Sort by time and find last closing deal (entry out)
+            matched.sort(key=lambda d: getattr(d, 'time', 0))
+            for deal in reversed(matched):
+                entry = getattr(deal, 'entry', None)
+                if entry in (getattr(mt5, 'DEAL_ENTRY_OUT', None), getattr(mt5, 'DEAL_ENTRY_OUT_BY', None)):
+                    return {
+                        'reason': self._map_deal_reason(getattr(deal, 'reason', None)),
+                        'profit': float(getattr(deal, 'profit', 0.0) or 0.0),
+                        'price': float(getattr(deal, 'price', 0.0) or 0.0),
+                        'volume': float(getattr(deal, 'volume', 0.0) or 0.0),
+                        'time': int(getattr(deal, 'time', 0) or 0)
+                    }
+        except Exception as e:
+            self._system_logger.error(f"get_last_close_for_position error: {e}")
+            return None
+
+        return None
+
+    def _map_deal_reason(self, reason_code: int) -> str:
+        mapping = {
+            getattr(mt5, 'DEAL_REASON_SL', None): 'SL',
+            getattr(mt5, 'DEAL_REASON_TP', None): 'TP',
+            getattr(mt5, 'DEAL_REASON_CLIENT', None): 'MANUAL',
+            getattr(mt5, 'DEAL_REASON_EXPERT', None): 'MANUAL',
+            getattr(mt5, 'DEAL_REASON_MOBILE', None): 'MANUAL',
+            getattr(mt5, 'DEAL_REASON_WEB', None): 'MANUAL',
+            getattr(mt5, 'DEAL_REASON_SO', None): 'SL',
+        }
+        return mapping.get(reason_code, 'UNKNOWN')
     
     def get_orders(self, symbol: str = None) -> List[Dict[str, Any]]:
         """Get pending orders."""

@@ -42,8 +42,8 @@ class SlackNotifier:
                 # Ensure messages are not queued after close
                 self.socket.setsockopt(zmq.LINGER, 0)
                 self.socket.bind(f"tcp://*:{port}")
-                # Give subscriber a moment to connect
-                time.sleep(0.1)
+                # Give subscriber a moment to connect (increase to reduce lost messages during startup)
+                time.sleep(1.0)
                 print(f"Slack notifier: TCP *:{port} (PUB)")
             except Exception as e:
                 print(f"Slack notifier: Failed to bind port {port}: {e}")
@@ -61,16 +61,41 @@ class SlackNotifier:
             magic: Magic number
             reason: CLOSE_REASON - MANUAL, TP, SL, BATCH
         """
-        if not self.socket:
-            return
-        try:
-            # Format: CLOSE_NOTIFY|ticket|direction|volume|price|profit|magic|reason
-            msg = f"CLOSE_NOTIFY|{ticket}|{direction}|{volume}|{price}|{profit}|{magic}|{reason}"
-            self.socket.send_string(msg)
-            reason_label = "TP" if reason == "TP" else ("SL" if reason == "SL" else ("BATCH" if reason == "BATCH" else "CLOSE"))
-            print(f"  [SLACK] Notified #{ticket} {direction} {volume} lots @{price} P&L=${profit:+.2f} [{reason_label}]")
-        except Exception as e:
-            print(f"  [SLACK] Failed to send: {e}")
+        # Format message
+        msg = f"CLOSE_NOTIFY|{ticket}|{direction}|{volume}|{price}|{profit}|{magic}|{reason}"
+
+        # If we have a PUB socket, publish via ZMQ (preferred)
+        if self.socket:
+            try:
+                self.socket.send_string(msg)
+                reason_label = "TP" if reason == "TP" else ("SL" if reason == "SL" else ("BATCH" if reason == "BATCH" else "CLOSE"))
+                print(f"  [SLACK] Notified #{ticket} {direction} {volume} lots @{price} P&L=${profit:+.2f} [{reason_label}]")
+                return
+            except Exception as e:
+                print(f"  [SLACK] Failed to send ZMQ notify: {e}")
+
+        # Fallback: send directly to Slack webhook if provided via environment variable
+        webhook = os.environ.get('SLACK_WEBHOOK', '').strip()
+        channel = os.environ.get('SLACK_CHANNEL', '').strip()
+        if webhook:
+            try:
+                # Build simple Slack payload (use default channel if channel not prefixed)
+                payload = {
+                    "text": f"POSITION CLOSED | #{ticket} {direction} {volume} lots @ {price:.2f} | P&L: ${profit:+.2f} | Reason: {reason}",
+                }
+                # If channel looks like '#... or @...', include it
+                if channel and (channel.startswith('#') or channel.startswith('@')):
+                    payload['channel'] = channel
+                import requests
+                resp = requests.post(webhook, json=payload, timeout=10)
+                if resp.status_code >= 200 and resp.status_code < 300:
+                    print(f"  [SLACK] Direct webhook sent for #{ticket} ({resp.status_code})")
+                else:
+                    print(f"  [SLACK] Direct webhook failed: {resp.status_code} {resp.text}")
+            except Exception as e:
+                print(f"  [SLACK] Direct webhook exception: {e}")
+        else:
+            print(f"  [SLACK] No ZMQ socket and no SLACK_WEBHOOK env var - cannot notify for #{ticket}")
     
     def close(self):
         if self.socket:
@@ -175,7 +200,22 @@ def map_reason_from_deal_reason(deal_reason):
     return reason_map.get(deal_reason, "UNKNOWN")
 
 
-def get_position_history_reason(ticket):
+def get_position_history_reason(client, ticket):
+    """Attempt to retrieve close reason and PnL for a ticket via python_bridge (OrderClient).
+    Falls back to local MetaTrader5 history if python_bridge not responding or not available.
+    Returns dict with keys: reason, profit, price, volume or None.
+    """
+    # Try python_bridge first via OrderClient
+    try:
+        if client:
+            client.send("POSITION_GET", {"ticket": ticket})
+            resp = client.get_response(timeout=5)
+            if resp and resp.get('success') and resp.get('data'):
+                return resp.get('data')
+    except Exception:
+        pass
+
+    # Fallback to local MT5 module if available
     if mt5 is None:
         return None
 
@@ -344,6 +384,9 @@ def main():
     print("Bat dau theo doi... (Ctrl+C de dung)")
     print("-" * 60)
     
+    # Keep a copy of tickets seen previously to detect NEW positions
+    last_seen_tickets = set(known_tickets)
+
     total_pnl_achieved = 0.0
     total_closed = 0
     global_closed_pnl = 0.0
@@ -377,7 +420,7 @@ def main():
                 print(f"\n!!! DETECTED {len(missing_tickets)} MISSING POSITION(S):")
                 for ticket in sorted(missing_tickets):
                     snapshot = known_positions.get(ticket, {})
-                    hist = get_position_history_reason(ticket)
+                    hist = get_position_history_reason(client, ticket)
                     reason = hist.get('reason') if hist else None
                     profit = hist.get('profit') if hist and hist.get('profit') is not None else float(snapshot.get('profit', 0) or 0)
                     price = hist.get('price') if hist and hist.get('price') is not None else float(snapshot.get('price_open', 0) or 0)
@@ -434,12 +477,11 @@ def main():
                 # Doc batch info tu file JSON
                 batch_info = load_batch_info()
                 
-                # Print status - moi batch 1 dong
-                print(f"[{elapsed:6.1f}s]")
+                # Build batch/group aggregates (no periodic printing)
+                batch_info = load_batch_info()
                 total_closed_pnl = 0.0
                 total_closed_count = 0
                 total_pnl_all = 0.0
-                batch_info = load_batch_info()
                 batches_to_close = []  # Cac batch can dong toan bo
                 
                 for magic, pos_list in magic_groups.items():
@@ -451,17 +493,22 @@ def main():
                     total_closed_pnl += closed_pnl
                     total_closed_count += closed_count
                     total_pnl_all += total_batch_pnl
-                    print(f"  Magic#{magic}: {len(pos_list)} pos dang mo | PnL: ${pnl:+.2f}/{target} | Da dong: {closed_count} pos, PnL: ${closed_pnl:+.2f} | Tong: ${total_batch_pnl:+.2f}")
                     
                     # Kiem tra neu batch dat target thi dong toan bo
                     if BATCH_PROFIT_TARGET > 0 and total_batch_pnl >= BATCH_PROFIT_TARGET:
                         batches_to_close.append({'magic': magic, 'pos_list': pos_list, 'total_pnl': total_batch_pnl})
-                
-                # Print 4 dong tong hop
-                print(f"  Dang mo: {len(positions)} pos, PnL: ${total_pnl_all:+.2f}")
-                print(f"  Da dong (lo): {loss_closed_count} pos, PnL: ${loss_closed_pnl:+.2f}")
-                print(f"  Da dong (lai): {profit_closed_count} pos, PnL: ${profit_closed_pnl:+.2f}")
-                print(f"  Tong da dong: {global_closed_count} pos, PnL: ${global_closed_pnl:+.2f}")
+
+                # If new positions appeared, print concise info about them
+                new_positions = current_tickets - last_seen_tickets
+                if new_positions:
+                    print(f"\n+++ New positions detected: {len(new_positions)}")
+                    for t in sorted(new_positions):
+                        p = known_positions.get(t, {})
+                        try:
+                            print(f"  NEW #{t}: {p.get('type','?')} {p.get('volume',0)} lots @ {p.get('price_open',0):.2f} | P&L: ${p.get('profit',0):+.2f} | Magic: {p.get('magic',0)}")
+                        except Exception:
+                            print(f"  NEW #{t}: details unavailable")
+                    last_seen_tickets.update(new_positions)
                 
                 # Check tung position trong tung batch
                 positions_to_close = []
@@ -616,7 +663,8 @@ def main():
                         batch_info = clear_batch_closed_info(batch_info, magic)
                         print(f"    Batch Magic#{magic} da reset!")
             else:
-                print(f"[{elapsed:6.1f}s] Cho positions moi...")
+                # No positions currently - quiet mode: only notify on events
+                pass
             
             time.sleep(CHECK_INTERVAL)
     
