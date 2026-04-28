@@ -240,7 +240,7 @@ impl Default for Config {
             no_trade_zone_pips: 10.0,
             
             // Confirmation
-            require_confirmation: true,
+            require_confirmation: false,
             // Momentum override defaults
             momentum_override_enabled: true,
             momentum_override_mult: 1.0,

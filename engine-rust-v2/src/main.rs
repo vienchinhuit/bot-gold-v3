@@ -179,8 +179,8 @@ struct Args {
         #[arg(long, default_value_t = false)]
         per_tick_log: bool,
 
-        /// Require one-candle entry confirmation (true = wait one candle to confirm entry)
-        #[arg(long, default_value_t = true)]
+                /// Require one-candle entry confirmation (true = wait one candle to confirm entry)
+        #[arg(long, default_value_t = false)]
         require_confirmation: bool,
 
 
