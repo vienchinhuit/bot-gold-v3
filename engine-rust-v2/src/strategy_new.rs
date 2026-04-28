@@ -198,30 +198,30 @@ impl Default for Config {
             atr_period: 14,
             
             // Sideway detection
-            sideway_ema_threshold: 0.30,  // 30 cents for GOLD
+            sideway_ema_threshold: 0.30,  // 30 cents for GOLD (unchanged)
             
             // Trend strength
-            min_trend_strength: 0.05,    // 20 cents minimum
+            min_trend_strength: 0.02,    // lowered to allow weaker trends for scalping
             
             // Pullback & FOMO
-            max_pullback_pips: 15.0,
-            max_fomo_pips: 25.0,
+            max_pullback_pips: 60.0,  // increased to allow scalp entries further from EMA
+            max_fomo_pips: 80.0,   // allow larger distance before anti-fomo blocks entry
             
             // RSI zones
-            rsi_oversold: 30.0,
-            rsi_overbought: 70.0,
+            rsi_oversold: 15.0,   // relax RSI oversold/overbought for scalp
+            rsi_overbought: 85.0,
             rsi_sell_confirm_low: 50.0,
             rsi_sell_confirm_high: 60.0,
             rsi_buy_confirm_low: 40.0,
             rsi_buy_confirm_high: 50.0,
             
             // Volatility
-            max_candle_mult: 1.5,
-            max_wick_ratio: 0.5,
+            max_candle_mult: 3.0,   // allow larger candles (less strict volatility filter)
+            max_wick_ratio: 2.0,   // tolerate larger wick-to-body ratio for fast moves
             
             // Scoring
-            min_score: 1,
-            min_confidence: 0.5,
+            min_score: 1, // keep low min_score for scalping
+            min_confidence: 0.30, // lower confidence threshold to allow more entries
             
             // Risk
             sl_mult: 1.2,
@@ -240,10 +240,10 @@ impl Default for Config {
             no_trade_zone_pips: 10.0,
             
             // Confirmation
-            require_confirmation: false,
+            require_confirmation: false, // no confirmation by default for higher frequency
             // Momentum override defaults
             momentum_override_enabled: true,
-            momentum_override_mult: 0.8,
+            momentum_override_mult: 0.6, // make momentum override easier to trigger
         }
     }
 }
@@ -1021,7 +1021,7 @@ pub fn should_trade(
     // ============================================================
     if !is_pullback(price, ema_fast, cfg.max_pullback_pips, cfg.pip_value) {
         let dist = (price - ema_fast).abs() / cfg.pip_value;
-        if dist > cfg.max_pullback_pips * 2.0 {
+        if dist > cfg.max_pullback_pips * 3.0 {
             return ret_skip(&format!(
                 "FILTER: Too far from EMA ({:.1} pips)",
                 dist

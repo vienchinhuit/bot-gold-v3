@@ -71,28 +71,28 @@ struct Args {
     max_total_volume: f64,
     
     /// Minimum score to enter trade
-    #[arg(long, default_value_t = 5)]
-    min_score: i32,
+        #[arg(long, default_value_t = 1)]
+        min_score: i32,
     
     /// Minimum confidence (0.0-1.0)
-    #[arg(long, default_value_t = 0.5)]
-    min_confidence: f64,
+        #[arg(long, default_value_t = 0.30)]
+        min_confidence: f64,
     
     /// Sideway EMA threshold
     #[arg(long, default_value_t = 0.30)]
     sideway_threshold: f64,
     
     /// Min trend strength (EMA distance)
-    #[arg(long, default_value_t = 0.05)]
-    min_trend_strength: f64,
+        #[arg(long, default_value_t = 0.02)]
+        min_trend_strength: f64,
     
     /// Max pullback distance from EMA (pips)
-    #[arg(long, default_value_t = 15.0)]
-    max_pullback_pips: f64,
+        #[arg(long, default_value_t = 60.0)]
+        max_pullback_pips: f64,
     
     /// Max FOMO distance (pips)
-    #[arg(long, default_value_t = 25.0)]
-    max_fomo_pips: f64,
+        #[arg(long, default_value_t = 80.0)]
+        max_fomo_pips: f64,
     
     /// Cooldown candles after loss
     #[arg(long, default_value_t = 15)]
@@ -107,8 +107,8 @@ struct Args {
     pause_minutes: i64,
     
     /// Max candle size multiplier (vs ATR)
-    #[arg(long, default_value_t = 1.5)]
-    max_candle_mult: f64,
+        #[arg(long, default_value_t = 3.0)]
+        max_candle_mult: f64,
     
     /// SL multiplier (ATR * this)
     #[arg(long, default_value_t = 1.2)]
@@ -360,14 +360,14 @@ fn main() {
         min_trend_strength: args.min_trend_strength,
         max_pullback_pips: args.max_pullback_pips,
         max_fomo_pips: args.max_fomo_pips,
-        rsi_oversold: 30.0,
-        rsi_overbought: 70.0,
+        rsi_oversold: 15.0,
+        rsi_overbought: 85.0,
         rsi_sell_confirm_low: 50.0,
         rsi_sell_confirm_high: 60.0,
         rsi_buy_confirm_low: 40.0,
         rsi_buy_confirm_high: 50.0,
                 max_candle_mult: args.max_candle_mult,
-        max_wick_ratio: 0.5,
+        max_wick_ratio: 2.0,
         min_score: args.min_score,
         min_confidence: args.min_confidence,
         sl_mult: args.sl_mult,
@@ -380,7 +380,7 @@ fn main() {
         no_trade_zone_pips: 100.0,
         require_confirmation: args.require_confirmation,
         momentum_override_enabled: true,
-        momentum_override_mult: 1.0,
+        momentum_override_mult: 0.6,
         };
 
         // Initialize Slack client early so optimizer can send updates
@@ -425,14 +425,14 @@ fn main() {
                     min_trend_strength: args.min_trend_strength,
                     max_pullback_pips: args.max_pullback_pips,
                     max_fomo_pips: args.max_fomo_pips,
-                    rsi_oversold: 30.0,
-                    rsi_overbought: 70.0,
+                    rsi_oversold: 15.0,
+                    rsi_overbought: 85.0,
                     rsi_sell_confirm_low: 50.0,
                     rsi_sell_confirm_high: 60.0,
                     rsi_buy_confirm_low: 40.0,
                     rsi_buy_confirm_high: 50.0,
                     max_candle_mult: args.max_candle_mult,
-                    max_wick_ratio: 0.5,
+                    max_wick_ratio: 2.0,
                     min_score: args.min_score,
                     min_confidence: args.min_confidence,
                     sl_mult: args.sl_mult,
@@ -445,7 +445,7 @@ fn main() {
                     no_trade_zone_pips: 100.0,
                     require_confirmation: args.require_confirmation,
         momentum_override_enabled: true,
-        momentum_override_mult: 1.0,
+        momentum_override_mult: 0.6,
                 };
 
         // If user requested a loose start, apply loose config regardless of logs
@@ -1567,7 +1567,8 @@ fn main() {
                                                         let mut sl_to_send = signal.stop_loss;
                                                         let mut tp_to_send = signal.take_profit;
                                                         let pip = config.pip_value;
-                                                        let mut min_stop_distance = 0.5_f64.max(state.atr.unwrap_or(0.0) * config.sl_mult);
+                                                        // Increase min stop distance slightly to avoid SL being placed too tight on low-ATR ticks
+                            let mut min_stop_distance = 0.5_f64.max(state.atr.unwrap_or(0.0) * config.sl_mult * 1.2);
 
                                                         // Try to get symbol info from python bridge to determine stop level
                                                         let sym_req = serde_json::json!({ "type": "SYMBOL_INFO", "data": { "symbol": resolved_symbol } });
@@ -1647,8 +1648,9 @@ fn main() {
                                                         fn round_down_to_pip(x: f64, pip: f64) -> f64 { (x / pip).floor() * pip }
                                                         fn round_up_to_pip(x: f64, pip: f64) -> f64 { (x / pip).ceil() * pip }
 
-                                                        // Add small extra buffer (at least 1 pip) to ensure strict > min requirement
-                                                        let extra = pip * 2.0;
+                                                        // Add a larger extra buffer to move SL further away from entry (reduces premature SL hits)
+                                                                                                                // Increase this multiplier if you want SL even further away
+                                                                                                                let extra = pip * 4.0;
                                                         match signal.direction {
                                                             Direction::Long => {
                                                                 let entry = signal.entry_price;
