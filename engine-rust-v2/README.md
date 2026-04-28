@@ -169,3 +169,146 @@ Nếu bạn muốn cải thiện:
 
 Nếu bạn muốn mình tạo thêm README tiếng Anh, hoặc thêm phần hướng dẫn chạy một ví dụ thực tế (kèm file history mẫu), chỉ cần cho biết — mình sẽ bổ sung.
 
+## CLI Options (tất cả các flag)
+
+Dưới đây là danh sách đầy đủ các tham số dòng lệnh mà `engine-rust-v2` hỗ trợ (tên flag, kiểu, giá trị mặc định và mô tả ngắn). Bạn có thể truyền các flag khi khởi chạy để điều chỉnh hành vi engine.
+
+- --market-addr (String, default: "tcp://127.0.0.1:5555")
+  - Địa chỉ ZMQ PUB để nhận market ticks.
+
+- --order-addr (String, default: "tcp://127.0.0.1:5556")
+  - Địa chỉ ZMQ ROUTER/DEALER để gửi lệnh tới python_bridge / order router.
+
+- --trade (bool, default: false)
+  - Bật trading thực tế (nếu false chỉ gửi signals/logs, không gửi order).
+
+- --symbol (String, default: "GOLD")
+  - Tên symbol để trade/lọc ticks.
+
+- --cooldown-sec (u64, default: 5)
+  - Khoảng thời gian tối thiểu (giây) giữa hai lệnh gửi (cooldown giữa các order requests).
+
+- --volume (f64, default: 0.01)
+  - Volume mặc định (lots) khi mở lệnh.
+
+- --max-volume-per-trade (f64, default: 0.10)
+  - Giới hạn tổng volume tối đa cho 1 hướng (long/short).
+
+- --max-total-volume (f64, default: 0.50)
+  - Giới hạn tổng volume trên tất cả các vị thế đang mở.
+
+- --min-score (i32, default: 5)
+  - Ngưỡng điểm tối thiểu (scoring) để chấp nhận entry.
+
+- --min-confidence (f64, default: 0.5)
+  - Ngưỡng niềm tin (confidence 0.0-1.0) cần đạt để vào lệnh.
+
+- --sideway-threshold (f64, default: 0.30)
+  - Ngưỡng kiểm tra sideway dựa trên |EMA_fast - EMA_slow| (đơn vị giá).
+
+- --min-trend-strength (f64, default: 0.20)
+  - Khoảng cách EMA tối thiểu để coi là trend hợp lệ.
+
+- --max-pullback-pips (f64, default: 15.0)
+  - Khoảng pullback tối đa (pips) từ EMA để chấp nhận entry.
+
+- --max-fomo-pips (f64, default: 25.0)
+  - Giới hạn anti-FOMO: nếu giá quá xa EMA (pips) sẽ không vào.
+
+- --cooldown-candles (usize, default: 15)
+  - Số candle cooldown sau 1 lệnh thua.
+
+- --max-losses (usize, default: 3)
+  - Số lệnh thua liên tiếp tối đa trước khi tạm dừng.
+
+- --pause-minutes (i64, default: 30)
+  - Thời gian tạm dừng (phút) khi đạt max_losses.
+
+- --max-candle-mult (f64, default: 1.5)
+  - Hệ số nhân ATR để xác định candle quá lớn (volatility filter).
+
+- --sl-mult (f64, default: 1.2)
+  - Hệ số nhân ATR để tính Stop Loss (SL = ATR * sl_mult).
+
+- --tp-mult (f64, default: 2.0)
+  - Hệ số nhân ATR để tính Take Profit.
+
+- --verbose (bool, default: false)
+  - Bật verbose per-tick logging.
+
+- --log-level (String, default: "info")
+  - Mức log RUST_LOG (info, debug, warn, error).
+
+- --slack-enabled (bool, default: false)
+  - Bật gửi thông báo Slack qua webhook khi phát hiện signal/close/optimizer.
+
+- --slack-webhook (String, default: "")
+  - URL webhook Slack để gửi message (nếu bật slack_enabled).
+
+- --slack-channel (String, default: "#trading")
+  - Channel (ví dụ #trading) hoặc user (@...) để override channel khi gửi webhook.
+
+- --slack-notify-port (u16, default: 0)
+  - Port TCP (ZMQ SUB) để nhận notifications đóng vị thế từ order_monitor.py (0 = disabled).
+
+- --auto-optimize (bool, default: false)
+  - Khi bật, engine sẽ chạy optimizer tại startup nếu có history và lưu kết quả.
+
+- --strategy-log-file (String, default: "strategy_logs.json")
+  - Đường dẫn file lưu logs/entries chiến lược.
+
+- --optimizer-output-file (String, default: "optimizer_result.json")
+  - File để lưu kết quả optimizer (best config + metrics).
+
+- --live-log-file (String, default: "strategy_logs.json")
+  - File append các logs per-live (một file thường được dùng cho cả live & strategy logs).
+
+- --auto-reload-optimized-config (bool, default: true)
+  - Auto reload file optimizer_output_file trong runtime (áp dụng best_config khi file thay đổi theo chu kỳ).
+
+- --optimizer-reload-sec (u64, default: 60)
+  - Số giây giữa các lần kiểm tra reload optimizer file.
+
+- --status-interval-sec (u64, default: 15)
+  - Khoảng thời gian (giây) để engine gửi Status message lên Slack (mặc định ~15s). Thích hợp đặt trong khoảng 10-15s.
+
+- --loose-start (bool, default: false)
+  - Nếu bật, engine áp config 'loose starter' để tăng tần suất trade lúc khởi động (dùng cho demo/testing).
+
+- --per-tick-log (bool, default: false)
+  - Log phân tích chi tiết mỗi tick (debug-level) khi bật.
+
+- --require-confirmation (bool, default: true)
+  - Mới: Bật/Tắt cơ chế one-candle confirmation trước entry. Nếu false thì skip bước chờ 1 candle xác nhận và sẽ vào lệnh ngay.
+
+- --history-file (String, default: "mt5_history.json")
+  - File chứa M1 historical candles (JSON array) để dùng cho optimizer/warmup nếu use_mt5_bridge=false.
+
+- --history-count (usize, default: 500)
+  - Số candle gần nhất cần load từ history_file hoặc python bridge.
+
+- --require-history (bool, default: false)
+  - Nếu true và không load được history khi startup -> engine sẽ exit.
+
+- --history-wait-sec (u64, default: 30)
+  - Thời gian chờ (giây) khi yêu cầu history qua python_bridge tại startup.
+
+- --use-mt5-bridge (bool, default: false)
+  - Dùng Python MT5 bridge (python_bridge) để lấy history / gửi lệnh thay vì file.
+
+- --mt5-bridge-script (String, default: "python_bridge/mt5_bridge.py")
+  - Đường dẫn tới script python bridge (thường không cần thay đổi).
+
+- --mt5-symbol (String, default: "GOLD")
+  - Symbol để request history khi dùng mt5 bridge.
+
+
+Lưu ý: Bạn có thể xem mô tả ngắn cho từng flag khi chạy `--help` (clap sẽ in giúp):
+
+```bash
+./engine-rust-v2 --help
+```
+
+Nếu bạn muốn mình thêm ví dụ chạy với 1 hoặc 2 tổ hợp flag thường dùng (ví dụ demo mode, live mode với Slack), mình sẽ bổ sung ở phần đầu README.
+
+

@@ -175,9 +175,14 @@ struct Args {
         #[arg(long, default_value_t = false)]
         loose_start: bool,
 
-        /// Log per-tick analysis (debug-level) each tick
+                /// Log per-tick analysis (debug-level) each tick
         #[arg(long, default_value_t = false)]
         per_tick_log: bool,
+
+        /// Require one-candle entry confirmation (true = wait one candle to confirm entry)
+        #[arg(long, default_value_t = true)]
+        require_confirmation: bool,
+
 
 
         /// Path to load historical M1 candles (JSON array) - optional
@@ -373,7 +378,7 @@ fn main() {
         pause_duration_minutes: args.pause_minutes,
         max_positions_per_direction: 10,
         no_trade_zone_pips: 100.0,
-        require_confirmation: true,
+        require_confirmation: args.require_confirmation,
         };
 
         // Initialize Slack client early so optimizer can send updates
@@ -436,7 +441,7 @@ fn main() {
                     pause_duration_minutes: args.pause_minutes,
                     max_positions_per_direction: 10,
                     no_trade_zone_pips: 100.0,
-                    require_confirmation: true,
+                    require_confirmation: args.require_confirmation,
                 };
 
         // If user requested a loose start, apply loose config regardless of logs
@@ -614,6 +619,7 @@ fn main() {
                 config.max_candle_mult = result.best_config.max_candle_mult;
                 config.sl_mult = result.best_config.sl_mult;
                 config.tp_mult = result.best_config.tp_mult;
+                config.require_confirmation = result.best_config.require_confirmation;
 
                 info!("OPTIMIZER APPLIED: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}",
                     config.min_score,
@@ -1107,6 +1113,7 @@ fn main() {
                                                                                 config.max_candle_mult = result.best_config.max_candle_mult;
                                                                                 config.sl_mult = result.best_config.sl_mult;
                                                                                 config.tp_mult = result.best_config.tp_mult;
+                                                                                config.require_confirmation = result.best_config.require_confirmation;
                                                                                 info!("CONFIG RELOADED FROM OPTIMIZER: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}",
                                                                                     config.min_score,
                                                                                     config.min_confidence,
@@ -1672,7 +1679,8 @@ fn main() {
                                                             config.max_candle_mult = result.best_config.max_candle_mult;
                                                             config.sl_mult = result.best_config.sl_mult;
                                                             config.tp_mult = result.best_config.tp_mult;
-
+                                                            config.require_confirmation = result.best_config.require_confirmation;
+  
                                                             info!("INCREMENTAL OPTIMIZER APPLIED: min_score={} min_conf={:.2} pullback={:.1} fomo={:.1}",
                                                                 config.min_score, config.min_confidence, config.max_pullback_pips, config.max_fomo_pips);
                                                         }
