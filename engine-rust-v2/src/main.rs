@@ -1643,10 +1643,44 @@ fn main() {
                                                             _ => {}
                                                         }
 
-                                                        // Round stops to pip grid
-                                                        fn round_to_pip(x: f64, pip: f64) -> f64 { ((x / pip).round()) * pip }
-                                                        sl_to_send = round_to_pip(sl_to_send, pip);
-                                                        tp_to_send = round_to_pip(tp_to_send, pip);
+                                                                                                                // Round stops to pip grid with directional rounding to ensure they are strictly beyond min_stop_distance
+                                                        fn round_down_to_pip(x: f64, pip: f64) -> f64 { (x / pip).floor() * pip }
+                                                        fn round_up_to_pip(x: f64, pip: f64) -> f64 { (x / pip).ceil() * pip }
+
+                                                        // Add small extra buffer (at least 1 pip) to ensure strict > min requirement
+                                                        let extra = pip * 2.0;
+                                                        match signal.direction {
+                                                            Direction::Long => {
+                                                                let entry = signal.entry_price;
+                                                                // ensure SL is at least min_stop_distance + extra away
+                                                                let desired_sl = entry - (min_stop_distance + extra);
+                                                                sl_to_send = round_down_to_pip(desired_sl, pip);
+                                                                // if rounding moved it too close, push one more pip away
+                                                                if (entry - sl_to_send) < min_stop_distance + 0.0000001 {
+                                                                    sl_to_send = round_down_to_pip(desired_sl - pip, pip);
+                                                                }
+
+                                                                // ensure TP is at least required ratio away and rounded up
+                                                                let sl_dist = (entry - sl_to_send).abs();
+                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                let desired_tp = entry + tp_req + extra;
+                                                                tp_to_send = round_up_to_pip(desired_tp, pip);
+                                                            }
+                                                            Direction::Short => {
+                                                                let entry = signal.entry_price;
+                                                                let desired_sl = entry + (min_stop_distance + extra);
+                                                                sl_to_send = round_up_to_pip(desired_sl, pip);
+                                                                if (sl_to_send - entry) < min_stop_distance + 0.0000001 {
+                                                                    sl_to_send = round_up_to_pip(desired_sl + pip, pip);
+                                                                }
+
+                                                                let sl_dist = (sl_to_send - entry).abs();
+                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                let desired_tp = entry - tp_req - extra;
+                                                                tp_to_send = round_down_to_pip(desired_tp, pip);
+                                                            }
+                                                            _ => {}
+                                                        }
 
                                                         let payload = serde_json::json!({
                                                             "type": "ORDER_SEND",
