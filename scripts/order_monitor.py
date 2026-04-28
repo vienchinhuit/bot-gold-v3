@@ -11,8 +11,22 @@ import json
 import time
 import threading
 import os
+import argparse
 from collections import defaultdict
 from datetime import datetime
+
+# Debug control (can be overridden by CLI flag --debug)
+OM_DEBUG = os.environ.get('OM_DEBUG', '').lower() in ('1', 'true', 'yes')
+
+def dbg(msg, *args):
+    if OM_DEBUG:
+        try:
+            if args:
+                print("[DEBUG] " + msg.format(*args))
+            else:
+                print("[DEBUG] " + str(msg))
+        except Exception:
+            print("[DEBUG] (format error)", msg)
 
 try:
     import MetaTrader5 as mt5
@@ -204,6 +218,11 @@ def get_position_history_reason(client, ticket):
     """Attempt to retrieve close reason and PnL for a ticket via python_bridge (OrderClient).
     Falls back to local MetaTrader5 history if python_bridge not responding or not available.
     Returns dict with keys: reason, profit, price, volume or None.
+
+    Notes:
+    - Aggregates all DEAL_ENTRY_OUT-type deals for the given position to compute realized PnL
+      (handles partial closes).
+    - Matches deals by stringifying the position id to avoid int/str mismatches.
     """
     # Try python_bridge first via OrderClient
     try:
@@ -220,27 +239,70 @@ def get_position_history_reason(client, ticket):
         return None
 
     try:
+        # Use a reasonable history window (7 days)
         end_time = time.time() + 60
         start_time = end_time - 7 * 24 * 3600
         deals = mt5.history_deals_get(start_time, end_time)
         if not deals:
+            dbg("mt5.history_deals_get returned no deals")
             return None
 
-        matched = [d for d in deals if getattr(d, "position_id", None) == ticket or getattr(d, "position", None) == ticket]
+        # Match deals by position id/position using string comparison to avoid type issues
+        ticket_str = str(ticket)
+        matched = []
+        for d in deals:
+            posid = getattr(d, 'position_id', None)
+            pos = getattr(d, 'position', None)
+            if (posid is not None and str(posid) == ticket_str) or (pos is not None and str(pos) == ticket_str):
+                matched.append(d)
+
         if not matched:
+            dbg(f"No history deals matched for ticket={ticket}")
             return None
 
-        matched.sort(key=lambda d: getattr(d, "time", 0))
-        for deal in reversed(matched):
-            entry = getattr(deal, "entry", None)
-            if entry in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_OUT_BY", None)):
-                return {
-                    'reason': map_reason_from_deal_reason(getattr(deal, "reason", None)),
-                    'profit': float(getattr(deal, "profit", 0.0) or 0.0),
-                    'price': float(getattr(deal, "price", 0.0) or 0.0),
-                    'volume': float(getattr(deal, "volume", 0.0) or 0.0),
-                }
-    except Exception:
+        # Sort by time ascending
+        matched.sort(key=lambda d: getattr(d, 'time', 0))
+
+        # Aggregate OUT deals
+        out_flags = (getattr(mt5, 'DEAL_ENTRY_OUT', None), getattr(mt5, 'DEAL_ENTRY_OUT_BY', None))
+        total_profit = 0.0
+        total_volume = 0.0
+        last_price = None
+        last_reason = None
+        debug_lines = []
+
+        for deal in matched:
+            entry = getattr(deal, 'entry', None)
+            profit_val = float(getattr(deal, 'profit', 0.0) or 0.0)
+            vol_val = float(getattr(deal, 'volume', 0.0) or 0.0)
+            price_val = float(getattr(deal, 'price', 0.0) or 0.0)
+            reason_val = getattr(deal, 'reason', None)
+            debug_lines.append(f"time={getattr(deal,'time',0)} entry={entry} profit={profit_val} vol={vol_val} price={price_val} reason={reason_val}")
+
+            if entry in out_flags:
+                total_profit += profit_val
+                total_volume += vol_val
+                if price_val:
+                    last_price = price_val
+                if reason_val is not None:
+                    last_reason = reason_val
+
+        dbg("Matched deals for ticket {}:\n{}".format(ticket, "\n".join(debug_lines)))
+        dbg(f"Aggregated OUT deals -> profit={total_profit} volume={total_volume} last_price={last_price} last_reason={last_reason}")
+
+        if total_volume == 0 and total_profit == 0.0:
+            # No OUT-type deals found; return None to let caller fallback to snapshot
+            dbg(f"No OUT-type deals found for ticket={ticket}")
+            return None
+
+        return {
+            'reason': map_reason_from_deal_reason(last_reason),
+            'profit': float(total_profit),
+            'price': float(last_price or 0.0),
+            'volume': float(total_volume),
+        }
+    except Exception as e:
+        dbg(f"get_position_history_reason exception: {e}")
         return None
 
     return None
@@ -348,8 +410,20 @@ def main():
     print("=" * 60)
     print()
     
+    # Parse CLI args for debug and notify port override
+    parser = argparse.ArgumentParser(description='Order Monitor')
+    parser.add_argument('-d', '--debug', action='store_true', help='Enable debug prints (overrides OM_DEBUG env var)')
+    parser.add_argument('--notify-port', type=int, default=None, help='Override SLACK_NOTIFY_PORT (ZMQ PUB bind)')
+    args = parser.parse_args()
+    global OM_DEBUG
+    if args.debug:
+        OM_DEBUG = True
+    dbg(f"CLI args: debug={args.debug} notify_port={args.notify_port}")
+
+    notify_port = args.notify_port if args.notify_port is not None else SLACK_NOTIFY_PORT
+
     client = OrderClient(port=PORT)
-    slack_notifier = SlackNotifier(port=SLACK_NOTIFY_PORT)
+    slack_notifier = SlackNotifier(port=notify_port)
     
     # Reset batch info khi khoi chay
     batch_info = load_batch_info()

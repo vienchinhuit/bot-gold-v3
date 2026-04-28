@@ -554,35 +554,74 @@ class MT5Connector:
         return result
 
     def get_last_close_for_position(self, ticket: int, lookback_days: int = 7) -> Optional[Dict[str, Any]]:
-        """Return the last deal that closed the given position ticket.
+        """Return aggregated close info for the given position ticket.
 
-        Scans MT5 history deals for the given position id and returns a dict with
-        keys: reason, profit, price, volume, time. Returns None if not found.
+        Scans MT5 history deals for the given position id and aggregates all
+        DEAL_ENTRY_OUT (and DEAL_ENTRY_OUT_BY) deals to compute realized PnL
+        and total closed volume. This handles partial closes correctly.
+
+        Returns dict with keys: reason, profit, price, volume, time. Returns None if not found.
         """
         try:
             end_time = time.time()
             start_time = end_time - lookback_days * 24 * 3600
             deals = mt5.history_deals_get(start_time, end_time)
             if not deals:
+                self._system_logger.debug("get_last_close_for_position: no deals returned")
                 return None
 
-            # Find deals matching position id (some brokers use 'position' or 'position_id')
-            matched = [d for d in deals if getattr(d, 'position_id', None) == ticket or getattr(d, 'position', None) == ticket]
+            ticket_str = str(ticket)
+            matched = []
+            for d in deals:
+                posid = getattr(d, 'position_id', None)
+                pos = getattr(d, 'position', None)
+                if (posid is not None and str(posid) == ticket_str) or (pos is not None and str(pos) == ticket_str):
+                    matched.append(d)
+
             if not matched:
+                self._system_logger.debug(f"get_last_close_for_position: no matched deals for ticket={ticket}")
                 return None
 
-            # Sort by time and find last closing deal (entry out)
+            # Sort by time ascending
             matched.sort(key=lambda d: getattr(d, 'time', 0))
-            for deal in reversed(matched):
+
+            out_flags = (getattr(mt5, 'DEAL_ENTRY_OUT', None), getattr(mt5, 'DEAL_ENTRY_OUT_BY', None))
+            total_profit = 0.0
+            total_volume = 0.0
+            last_price = None
+            last_reason = None
+            last_time = 0
+
+            for deal in matched:
                 entry = getattr(deal, 'entry', None)
-                if entry in (getattr(mt5, 'DEAL_ENTRY_OUT', None), getattr(mt5, 'DEAL_ENTRY_OUT_BY', None)):
-                    return {
-                        'reason': self._map_deal_reason(getattr(deal, 'reason', None)),
-                        'profit': float(getattr(deal, 'profit', 0.0) or 0.0),
-                        'price': float(getattr(deal, 'price', 0.0) or 0.0),
-                        'volume': float(getattr(deal, 'volume', 0.0) or 0.0),
-                        'time': int(getattr(deal, 'time', 0) or 0)
-                    }
+                profit_val = float(getattr(deal, 'profit', 0.0) or 0.0)
+                vol_val = float(getattr(deal, 'volume', 0.0) or 0.0)
+                price_val = float(getattr(deal, 'price', 0.0) or 0.0)
+                reason_val = getattr(deal, 'reason', None)
+                time_val = int(getattr(deal, 'time', 0) or 0)
+
+                if entry in out_flags:
+                    total_profit += profit_val
+                    total_volume += vol_val
+                    if price_val:
+                        last_price = price_val
+                    if reason_val is not None:
+                        last_reason = reason_val
+                    if time_val:
+                        last_time = max(last_time, time_val)
+
+            if total_volume == 0 and total_profit == 0.0:
+                # No OUT-type deals found
+                self._system_logger.debug(f"get_last_close_for_position: no OUT deals for ticket={ticket}")
+                return None
+
+            return {
+                'reason': self._map_deal_reason(last_reason),
+                'profit': float(total_profit),
+                'price': float(last_price or 0.0),
+                'volume': float(total_volume),
+                'time': int(last_time)
+            }
         except Exception as e:
             self._system_logger.error(f"get_last_close_for_position error: {e}")
             return None
