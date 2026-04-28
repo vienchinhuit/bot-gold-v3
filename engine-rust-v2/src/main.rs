@@ -1157,9 +1157,49 @@ fn main() {
                         format!("CurrentCandle: t={} O={:.2} H={:.2} L={:.2} C={:.2} V={}", current_candle.time, current_candle.open, current_candle.high, current_candle.low, current_candle.close, current_candle.volume)
                     };
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                        // Build score breakdown to include in status
+                    let ema_diff = if state.ema_fast.is_some() && state.ema_slow.is_some() {
+                        (state.ema_fast.unwrap() - state.ema_slow.unwrap()).abs()
+                    } else { 0.0 };
+                    let trend_pts = if ema_diff >= 0.20 { 2 } else if ema_diff >= 0.10 { 1 } else { 0 };
+                    let strength_pts = if ema_diff >= 0.40 { 2 } else if ema_diff >= 0.20 { 1 } else { 0 };
+                    let highs_vec_tmp: Vec<f64> = state.highs.iter().copied().collect();
+                    let lows_vec_tmp: Vec<f64> = state.lows.iter().copied().collect();
+                    let structure_tmp = detect_structure(&highs_vec_tmp, &lows_vec_tmp, 20);
+                    let struct_pts = match structure_tmp {
+                        SwingType::HigherHigh => 2,
+                        SwingType::HigherLow => 1,
+                        SwingType::LowerLow => 2,
+                        SwingType::LowerHigh => 1,
+                        _ => 0,
+                    };
+                    let pullback_ok_tmp = state.ema_fast.map_or(false, |ema| is_pullback(price, ema, config.max_pullback_pips, config.pip_value));
+                    let pullback_pts = if pullback_ok_tmp { 1 } else { 0 };
+                    let rsi_val_tmp = state.rsi.unwrap_or(50.0);
+                    let rsi_pts = if (rsi_val_tmp > 50.0 && rsi_val_tmp < 70.0) || (rsi_val_tmp >= 30.0 && rsi_val_tmp < 50.0) { 1 } else { 0 };
+                    let vol_pts = 1; // assumed OK
+                    let confirm_pts = if config.require_confirmation { 1 } else { 0 };
+                    let total_pts = trend_pts + strength_pts + struct_pts + pullback_pts + rsi_pts + vol_pts + confirm_pts;
+
+                    let breakdown_text = format!("[ScoreBreakdown] T:{} S:{} St:{} P:{} R:{} V:{} C:{} Total:{}",
+                        trend_pts, strength_pts, struct_pts, pullback_pts, rsi_pts, vol_pts, confirm_pts, total_pts);
+
                     let status_msg = format!(
-                        "Price={:.2} | {} | EMA20/50={} | {} | Ticks={} | {}",
-                        price, trend_status, ema_str, rsi_str, state.ticks_processed, candle_info
+                        "Price={:.2} | {} | EMA20/50={} | {} | Ticks={} | {} | {}",
+                        price, trend_status, ema_str, rsi_str, state.ticks_processed, candle_info, breakdown_text
                     );
 
                     if slack.is_enabled() {
@@ -1345,9 +1385,40 @@ fn main() {
                                                                     format!("CurrentCandle: t={} O={:.2} H={:.2} L={:.2} C={:.2} V={}", current_candle.time, current_candle.open, current_candle.high, current_candle.low, current_candle.close, current_candle.volume)
                                                                 };
 
+
+
+
+
+                                                                // Build score breakdown to include in status
+                                                                let ema_diff = if state.ema_fast.is_some() && state.ema_slow.is_some() {
+                                                                    (state.ema_fast.unwrap() - state.ema_slow.unwrap()).abs()
+                                                                } else { 0.0 };
+                                                                let trend_pts = if ema_diff >= 0.20 { 2 } else if ema_diff >= 0.10 { 1 } else { 0 };
+                                                                let strength_pts = if ema_diff >= 0.40 { 2 } else if ema_diff >= 0.20 { 1 } else { 0 };
+                                                                let highs_vec_tmp: Vec<f64> = state.highs.iter().copied().collect();
+                                                                let lows_vec_tmp: Vec<f64> = state.lows.iter().copied().collect();
+                                                                let structure_tmp = detect_structure(&highs_vec_tmp, &lows_vec_tmp, 20);
+                                                                let struct_pts = match structure_tmp {
+                                                                    SwingType::HigherHigh => 2,
+                                                                    SwingType::HigherLow => 1,
+                                                                    SwingType::LowerLow => 2,
+                                                                    SwingType::LowerHigh => 1,
+                                                                    _ => 0,
+                                                                };
+                                                                let pullback_ok_tmp = state.ema_fast.map_or(false, |ema| is_pullback(price, ema, config.max_pullback_pips, config.pip_value));
+                                                                let pullback_pts = if pullback_ok_tmp { 1 } else { 0 };
+                                                                let rsi_val_tmp = state.rsi.unwrap_or(50.0);
+                                                                let rsi_pts = if (rsi_val_tmp > 50.0 && rsi_val_tmp < 70.0) || (rsi_val_tmp >= 30.0 && rsi_val_tmp < 50.0) { 1 } else { 0 };
+                                                                let vol_pts = 1; // assumed OK
+                                                                let confirm_pts = if config.require_confirmation { 1 } else { 0 };
+                                                                let total_pts = trend_pts + strength_pts + struct_pts + pullback_pts + rsi_pts + vol_pts + confirm_pts;
+
+                                                                let breakdown_text = format!("[ScoreBreakdown] T:{} S:{} St:{} P:{} R:{} V:{} C:{} Total:{}",
+                                                                    trend_pts, strength_pts, struct_pts, pullback_pts, rsi_pts, vol_pts, confirm_pts, total_pts);
+
                                                                 let status_msg = format!(
-                                                                    "Price={:.2} | {} | EMA20/50={} | {} | Ticks={} | {}",
-                                                                    price, trend_status, ema_str, rsi_str, state.ticks_processed, candle_info
+                                                                    "Price={:.2} | {} | EMA20/50={} | {} | Ticks={} | {} | {}",
+                                                                    price, trend_status, ema_str, rsi_str, state.ticks_processed, candle_info, breakdown_text
                                                                 );
 
                                                                 if slack.is_enabled() {
@@ -1357,9 +1428,19 @@ fn main() {
                                                                         debug!("Slack status sent");
                                                                     }
                                                                 }
-
                                                                 last_status_time = Some(now);
-                        }
+                }
+
+
+
+
+
+
+
+
+
+
+
 
                     }
                 }
@@ -1390,9 +1471,36 @@ fn main() {
                         let rsi_pts = if (rsi_val > 50.0 && rsi_val < 70.0) || (rsi_val >= 30.0 && rsi_val < 50.0) { 1 } else { 0 };
                         let potential_total = trend_pts + strength_pts + struct_pts + pullback_pts + rsi_pts + 2;
                         
+
+
+
+
+
+
+
+
+
+
+                                                // Build breakdown for heartbeat as well
+                        let highs_vec_tmp: Vec<f64> = state.highs.iter().copied().collect();
+                        let lows_vec_tmp: Vec<f64> = state.lows.iter().copied().collect();
+                        let structure_tmp = detect_structure(&highs_vec_tmp, &lows_vec_tmp, 20);
+                        let trend_pts_h = if ema_diff >= 0.20 { 2 } else if ema_diff >= 0.10 { 1 } else { 0 };
+                        let strength_pts_h = if ema_diff >= 0.40 { 2 } else if ema_diff >= 0.20 { 1 } else { 0 };
+                        let struct_pts_h = match structure_tmp { SwingType::HigherHigh => 2, SwingType::HigherLow => 1, SwingType::LowerLow => 2, SwingType::LowerHigh => 1, _ => 0 };
+                        let pullback_ok_tmp = state.ema_fast.map_or(false, |ema| is_pullback(price, ema, config.max_pullback_pips, config.pip_value));
+                        let pullback_pts_h = if pullback_ok_tmp { 1 } else { 0 };
+                        let rsi_val_tmp = state.rsi.unwrap_or(50.0);
+                        let rsi_pts_h = if (rsi_val_tmp > 50.0 && rsi_val_tmp < 70.0) || (rsi_val_tmp >= 30.0 && rsi_val_tmp < 50.0) { 1 } else { 0 };
+                        let vol_pts_h = 1;
+                        let confirm_pts_h = if config.require_confirmation { 1 } else { 0 };
+                        let total_score = trend_pts_h + strength_pts_h + struct_pts_h + pullback_pts_h + rsi_pts_h + vol_pts_h + confirm_pts_h;
+
+                        let breakdown_text = format!("T:{} S:{} St:{} P:{} R:{} V:{} C:{}", trend_pts_h, strength_pts_h, struct_pts_h, pullback_pts_h, rsi_pts_h, vol_pts_h, confirm_pts_h);
+
                         let status_msg = format!(
-                            "Price={:.2} | {} | Score={}/10 | Cooldown={} | Long={} Short={} | Ticks={}",
-                            price, trend_status, potential_total, state.cooldown_counter,
+                            "Price={:.2} | {} | Score={}/10 | Breakdown={} | Cooldown={} | Long={} Short={} | Ticks={}",
+                            price, trend_status, total_score, breakdown_text, state.cooldown_counter,
                             state.long_positions, state.short_positions, state.ticks_processed
                         );
                         if let Err(e) = slack.send_status(&status_msg) {
