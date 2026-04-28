@@ -232,6 +232,35 @@ class OrderWorker:
                 except Exception as e:
                     self._order_logger.error(f"POSITION_GET error: {e}")
                     return json.dumps({"success": False, "error": str(e)})
+
+            elif msg_type == "SYMBOL_INFO":
+                # Return symbol information (including point, tick_size and stop level if available)
+                symbol = None
+                try:
+                    if isinstance(data, dict):
+                        symbol = data.get('symbol') or data.get('sym')
+                    else:
+                        symbol = data
+                except Exception:
+                    symbol = None
+
+                if not symbol:
+                    return json.dumps({"success": False, "error": "No symbol provided"})
+
+                self._order_logger.info(f"Processing SYMBOL_INFO for symbol={symbol}")
+                try:
+                    info = self.mt5.get_symbol_info(symbol)
+                    if info:
+                        # Try to include stop level if available from MT5 symbol object
+                        # mt5.symbol_info returns an object; we'll attempt to extract common fields
+                        # But get_symbol_info already returns a dict with point and tick_size.
+                        # So just return it as data
+                        return json.dumps({"success": True, "data": info})
+                    else:
+                        return json.dumps({"success": False, "error": "Symbol info not found"})
+                except Exception as e:
+                    self._order_logger.error(f"SYMBOL_INFO error: {e}")
+                    return json.dumps({"success": False, "error": str(e)})
             else:
                 self._order_logger.warning(f"Unknown message type: {msg_type}")
                 return json.dumps({"success": False, "error": f"Unknown message type: {msg_type}"})

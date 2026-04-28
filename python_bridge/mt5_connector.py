@@ -170,6 +170,14 @@ class MT5Connector:
         if info is None:
             return None
         
+        # Try to fetch stop level if available on this platform/terminal
+        stop_level = None
+        try:
+            # Common attribute names may vary by platform/version
+            stop_level = getattr(info, 'trade_stops_level', None) or getattr(info, 'stoplevel', None) or getattr(info, 'stop_level', None)
+        except Exception:
+            stop_level = None
+
         return {
             'symbol': info.name,
             'bid': info.bid,
@@ -187,6 +195,7 @@ class MT5Connector:
             'volume_min': info.volume_min,
             'volume_max': info.volume_max,
             'volume_step': info.volume_step,
+            'stop_level': float(stop_level) if stop_level is not None else None,
         }
     
     def send_order(self, request: OrderRequest) -> OrderResponse:

@@ -83,7 +83,7 @@ struct Args {
     sideway_threshold: f64,
     
     /// Min trend strength (EMA distance)
-    #[arg(long, default_value_t = 0.20)]
+    #[arg(long, default_value_t = 0.10)]
     min_trend_strength: f64,
     
     /// Max pullback distance from EMA (pips)
@@ -1563,6 +1563,91 @@ fn main() {
                                                         let comment = format!("v2:{}+{:.0}", signal.score, signal.confidence * 100.0);
                                                         let comment = if comment.len() > 27 { &comment[..27] } else { &comment };
                             
+                                                                                                                // Before sending order, query broker symbol info (stop level, point) via python_bridge
+                                                        let mut sl_to_send = signal.stop_loss;
+                                                        let mut tp_to_send = signal.take_profit;
+                                                        let pip = config.pip_value;
+                                                        let mut min_stop_distance = 0.5_f64.max(state.atr.unwrap_or(0.0) * config.sl_mult);
+
+                                                        // Try to get symbol info from python bridge to determine stop level
+                                                        let sym_req = serde_json::json!({ "type": "SYMBOL_INFO", "data": { "symbol": resolved_symbol } });
+                                                        let sym_req_s = sym_req.to_string();
+                                                        if let Err(e) = sock.send(sym_req_s.as_bytes(), 0) {
+                                                            debug!("Failed to request SYMBOL_INFO: {:?}", e);
+                                                        } else {
+                                                            match sock.recv_string(0) {
+                                                                Ok(Ok(resp)) => {
+                                                                    debug!("SYMBOL_INFO raw: {}", resp);
+                                                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+                                                                        if v.get("success").and_then(|x| x.as_bool()).unwrap_or(false) {
+                                                                            if let Some(data) = v.get("data") {
+                                                                                // Extract point and stop_level if present
+                                                                                let point = data.get("point").and_then(|x| x.as_f64()).unwrap_or(config.pip_value);
+                                                                                let stop_level_opt = data.get("stop_level").and_then(|x| x.as_f64());
+                                                                                if let Some(stop_pts) = stop_level_opt {
+                                                                                    let stop_price = stop_pts * point;
+                                                                                    if stop_price > 0.0 {
+                                                                                        min_stop_distance = stop_price.max(min_stop_distance);
+                                                                                        debug!("Broker stop_level: {} pts, point={} => min_stop_distance set to {}", stop_pts, point, min_stop_distance);
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        } else if v.get("point").is_some() {
+                                                                            // sometimes raw symbol dict returned without success wrapper
+                                                                            let data = &v;
+                                                                            let point = data.get("point").and_then(|x| x.as_f64()).unwrap_or(config.pip_value);
+                                                                            let stop_level_opt = data.get("stop_level").and_then(|x| x.as_f64());
+                                                                            if let Some(stop_pts) = stop_level_opt {
+                                                                                let stop_price = stop_pts * point;
+                                                                                if stop_price > 0.0 {
+                                                                                    min_stop_distance = stop_price.max(min_stop_distance);
+                                                                                    debug!("Broker stop_level (raw): {} pts, point={} => min_stop_distance set to {}", stop_pts, point, min_stop_distance);
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Ok(Err(_)) => debug!("Non-UTF8 SYMBOL_INFO reply"),
+                                                                Err(e) => debug!("No SYMBOL_INFO reply: {:?}", e),
+                                                            }
+                                                        }
+
+                                                        // Add small buffer (one pip) to be safe
+                                                        min_stop_distance += pip;
+
+                                                        // Ensure SL/TP satisfy broker min distance and correct side
+                                                        match signal.direction {
+                                                            Direction::Long => {
+                                                                let entry = signal.entry_price;
+                                                                if (entry - sl_to_send).abs() < min_stop_distance {
+                                                                    sl_to_send = entry - min_stop_distance;
+                                                                }
+                                                                // ensure TP is beyond minimum relative to entry (keep ratio)
+                                                                let sl_dist = (entry - sl_to_send).abs();
+                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                if (tp_to_send - entry).abs() < tp_req {
+                                                                    tp_to_send = entry + tp_req;
+                                                                }
+                                                            }
+                                                            Direction::Short => {
+                                                                let entry = signal.entry_price;
+                                                                if (sl_to_send - entry).abs() < min_stop_distance {
+                                                                    sl_to_send = entry + min_stop_distance;
+                                                                }
+                                                                let sl_dist = (sl_to_send - entry).abs();
+                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                if (entry - tp_to_send).abs() < tp_req {
+                                                                    tp_to_send = entry - tp_req;
+                                                                }
+                                                            }
+                                                            _ => {}
+                                                        }
+
+                                                        // Round stops to pip grid
+                                                        fn round_to_pip(x: f64, pip: f64) -> f64 { ((x / pip).round()) * pip }
+                                                        sl_to_send = round_to_pip(sl_to_send, pip);
+                                                        tp_to_send = round_to_pip(tp_to_send, pip);
+
                                                         let payload = serde_json::json!({
                                                             "type": "ORDER_SEND",
                                                             "data": {
@@ -1570,8 +1655,8 @@ fn main() {
                                                                 "volume": args.volume,
                                                                 "order_type": order_type,
                                                                 "price": 0,
-                                                                "stop_loss": signal.stop_loss,
-                                                                "take_profit": signal.take_profit,
+                                                                "stop_loss": sl_to_send,
+                                                                "take_profit": tp_to_send,
                                                                 "comment": comment,
                                                                 "magic": 2100,
                                                                 "request_id": request_id
@@ -1579,13 +1664,13 @@ fn main() {
                                                         });
                             
                                                         let s = payload.to_string();
-                            info!("📤 EXECUTING {} {} lots @ {} | SL={:.2} TP={:.2}",
-                                order_type, args.volume, signal.entry_price, signal.stop_loss, signal.take_profit);
+                            info!("📤 EXECUTING {} {} lots @ {} | SL={:.5} TP={:.5} (min_stop_req={:.5})",
+                                order_type, args.volume, signal.entry_price, sl_to_send, tp_to_send, min_stop_distance);
 
                             // Notify Slack about order request
                             if slack.is_enabled() {
-                                let sl_opt = if signal.stop_loss > 0.0 { Some(signal.stop_loss) } else { None };
-                                let tp_opt = if signal.take_profit > 0.0 { Some(signal.take_profit) } else { None };
+                                let sl_opt = if sl_to_send > 0.0 { Some(sl_to_send) } else { None };
+                                let tp_opt = if tp_to_send > 0.0 { Some(tp_to_send) } else { None };
                                 if let Err(e) = slack.send_order_request(order_type, args.volume, signal.entry_price, sl_opt, tp_opt, &request_id) {
                                     warn!("Failed to send order request notification to Slack: {}", e);
                                 }
