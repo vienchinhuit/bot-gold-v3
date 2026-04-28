@@ -29,19 +29,12 @@ SLACK_NOTIFY_PORT = 5557  # Port de gui close notifications den Rust engine (0 =
 
 
 class SlackNotifier:
-    """Gui notification qua ZMQ den Rust engine de forward qua Slack.
-
-    Notes:
-    - ZMQ sockets are not thread-safe. We protect send with a lock so send_close_notify
-      can be called from background threads safely.
-    - If PUB send fails we fall back to direct Slack webhook when available.
-    """
+    """"Gui notification qua ZMQ den Rust engine de forward qua Slack."""
     
     def __init__(self, port=5557):
         self.port = port
         self.context = None
         self.socket = None
-        self._send_lock = threading.Lock()
         if port > 0:
             try:
                 self.context = zmq.Context()
@@ -74,14 +67,12 @@ class SlackNotifier:
         # If we have a PUB socket, publish via ZMQ (preferred)
         if self.socket:
             try:
-                with self._send_lock:
-                    self.socket.send_string(msg)
+                self.socket.send_string(msg)
                 reason_label = "TP" if reason == "TP" else ("SL" if reason == "SL" else ("BATCH" if reason == "BATCH" else "CLOSE"))
                 print(f"  [SLACK] Notified #{ticket} {direction} {volume} lots @{price} P&L=${profit:+.2f} [{reason_label}]")
                 return
             except Exception as e:
                 print(f"  [SLACK] Failed to send ZMQ notify: {e}")
-                # Continue to webhook fallback if configured
 
         # Fallback: send directly to Slack webhook if provided via environment variable
         webhook = os.environ.get('SLACK_WEBHOOK', '').strip()
@@ -108,15 +99,9 @@ class SlackNotifier:
     
     def close(self):
         if self.socket:
-            try:
-                self.socket.close()
-            except Exception:
-                pass
+            self.socket.close()
         if self.context:
-            try:
-                self.context.term()
-            except Exception:
-                pass
+            self.context.term()
 
 
 STOP_LOSS = 0  # Dat >0 de tu dong khi lo (VD: 10 = dong khi lo $10), dat 0 de tat
@@ -219,9 +204,6 @@ def get_position_history_reason(client, ticket):
     """Attempt to retrieve close reason and PnL for a ticket via python_bridge (OrderClient).
     Falls back to local MetaTrader5 history if python_bridge not responding or not available.
     Returns dict with keys: reason, profit, price, volume or None.
-
-    NOTE: For accurate realized PnL we aggregate all DEAL_ENTRY_OUT-type deals for the
-    given position (handles partial closes) and return the summed profit.
     """
     # Try python_bridge first via OrderClient
     try:
@@ -238,7 +220,6 @@ def get_position_history_reason(client, ticket):
         return None
 
     try:
-        # Use a reasonable history window (7 days) as before
         end_time = time.time() + 60
         start_time = end_time - 7 * 24 * 3600
         deals = mt5.history_deals_get(start_time, end_time)
@@ -249,65 +230,20 @@ def get_position_history_reason(client, ticket):
         if not matched:
             return None
 
-        # Sort by time ascending
         matched.sort(key=lambda d: getattr(d, "time", 0))
-
-        # Aggregate all DEAL_ENTRY_OUT (and DEAL_ENTRY_OUT_BY) deals to compute realized PnL
-        out_flags = (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_OUT_BY", None))
-        total_profit = 0.0
-        total_volume = 0.0
-        last_price = None
-        last_reason = None
-        found_out = False
-
-        for deal in matched:
+        for deal in reversed(matched):
             entry = getattr(deal, "entry", None)
-            if entry in out_flags:
-                found_out = True
-                profit_val = float(getattr(deal, "profit", 0.0) or 0.0)
-                vol_val = float(getattr(deal, "volume", 0.0) or 0.0)
-                price_val = float(getattr(deal, "price", 0.0) or 0.0)
-                reason_val = getattr(deal, "reason", None)
-
-                total_profit += profit_val
-                total_volume += vol_val
-                last_price = price_val if price_val else last_price
-                last_reason = reason_val if reason_val is not None else last_reason
-
-        if not found_out:
-            return None
-
-        return {
-            'reason': map_reason_from_deal_reason(last_reason),
-            'profit': float(total_profit),
-            'price': float(last_price or 0.0),
-            'volume': float(total_volume),
-        }
+            if entry in (getattr(mt5, "DEAL_ENTRY_OUT", None), getattr(mt5, "DEAL_ENTRY_OUT_BY", None)):
+                return {
+                    'reason': map_reason_from_deal_reason(getattr(deal, "reason", None)),
+                    'profit': float(getattr(deal, "profit", 0.0) or 0.0),
+                    'price': float(getattr(deal, "price", 0.0) or 0.0),
+                    'volume': float(getattr(deal, "volume", 0.0) or 0.0),
+                }
     except Exception:
         return None
 
     return None
-
-
-def fetch_close_info(client, ticket, timeout=4, poll_interval=0.5):
-    """Poll for close info (history) until available or timeout.
-
-    Tries python_bridge POSITION_GET and MT5 history repeatedly until a close
-    deal is found or timeout expires. Returns the same dict shape as
-    get_position_history_reason when successful, otherwise None.
-    """
-    start = time.time()
-    last = None
-    while time.time() - start < timeout:
-        try:
-            info = get_position_history_reason(client, ticket)
-            if info:
-                return info
-            last = info
-        except Exception:
-            pass
-        time.sleep(poll_interval)
-    return last
 
 
 def get_position_detail(client, ticket):
@@ -484,7 +420,7 @@ def main():
                 print(f"\n!!! DETECTED {len(missing_tickets)} MISSING POSITION(S):")
                 for ticket in sorted(missing_tickets):
                     snapshot = known_positions.get(ticket, {})
-                    hist = fetch_close_info(client, ticket, timeout=4, poll_interval=0.5)
+                    hist = get_position_history_reason(client, ticket)
                     reason = hist.get('reason') if hist else None
                     profit = hist.get('profit') if hist and hist.get('profit') is not None else float(snapshot.get('profit', 0) or 0)
                     price = hist.get('price') if hist and hist.get('price') is not None else float(snapshot.get('price_open', 0) or 0)
@@ -596,37 +532,20 @@ def main():
                         
                         if resp and resp.get('success'):
                             print(f"    SUCCESS!")
-                            # Mark as explicitly closed early to avoid duplicate auto-close detection
+                            # Gui Slack notification
+                            slack_notifier.send_close_notify(
+                                ticket=pos['ticket'],
+                                direction=pos.get('type', 'UNKNOWN'),
+                                volume=pos.get('volume', 0),
+                                price=pos.get('price_open', 0),
+                                profit=pos['profit'],
+                                magic=pos.get('magic', 0),
+                                reason="MANUAL"
+                            )
+                            
+                            # Track as explicitly closed
                             confirmed_closed_tickets.add(pos['ticket'])
                             processed_closed_tickets.add(pos['ticket'])
-                            
-                            # Defer Slack notification briefly and fetch accurate P&L from history
-                            def deferred_close_notify(client_ref, slack_ref, ticket, snapshot, reason_hint="MANUAL", delay=1.5):
-                                try:
-                                    time.sleep(delay)
-                                    hist = fetch_close_info(client_ref, ticket, timeout=4, poll_interval=0.5)
-                                    if hist:
-                                        profit = hist.get('profit', float(snapshot.get('profit', 0) or 0))
-                                        price = hist.get('price', float(snapshot.get('price_open', 0) or 0))
-                                        volume = hist.get('volume', float(snapshot.get('volume', 0) or 0))
-                                        reason = hist.get('reason') or reason_hint
-                                    else:
-                                        profit = float(snapshot.get('profit', 0) or 0)
-                                        price = float(snapshot.get('price_open', 0) or 0)
-                                        volume = float(snapshot.get('volume', 0) or 0)
-                                        reason = reason_hint
-                                    slack_ref.send_close_notify(
-                                        ticket=ticket,
-                                        direction=snapshot.get('type', 'UNKNOWN'),
-                                        volume=volume,
-                                        price=price,
-                                        profit=profit,
-                                        magic=snapshot.get('magic', 0),
-                                        reason=reason
-                                    )
-                                except Exception:
-                                    pass
-                            threading.Thread(target=deferred_close_notify, args=(client, slack_notifier, pos['ticket'], pos, "MANUAL"), daemon=True).start()
                             
                             total_pnl_achieved += pos['profit']
                             total_closed += 1
@@ -656,37 +575,20 @@ def main():
                         
                         if resp and resp.get('success'):
                             print(f"    SUCCESS!")
-                            # Mark as explicitly closed early to avoid duplicate auto-close detection
+                            # Gui Slack notification
+                            slack_notifier.send_close_notify(
+                                ticket=pos['ticket'],
+                                direction=pos.get('type', 'UNKNOWN'),
+                                volume=pos.get('volume', 0),
+                                price=pos.get('price_open', 0),
+                                profit=pos['profit'],
+                                magic=pos.get('magic', 0),
+                                reason="SL"
+                            )
+                            
+                            # Track as explicitly closed
                             confirmed_closed_tickets.add(pos['ticket'])
                             processed_closed_tickets.add(pos['ticket'])
-                            
-                            # Defer Slack notification briefly and fetch accurate P&L from history
-                            def deferred_close_notify(client_ref, slack_ref, ticket, snapshot, reason_hint="SL", delay=1.5):
-                                try:
-                                    time.sleep(delay)
-                                    hist = fetch_close_info(client_ref, ticket, timeout=4, poll_interval=0.5)
-                                    if hist:
-                                        profit = hist.get('profit', float(snapshot.get('profit', 0) or 0))
-                                        price = hist.get('price', float(snapshot.get('price_open', 0) or 0))
-                                        volume = hist.get('volume', float(snapshot.get('volume', 0) or 0))
-                                        reason = hist.get('reason') or reason_hint
-                                    else:
-                                        profit = float(snapshot.get('profit', 0) or 0)
-                                        price = float(snapshot.get('price_open', 0) or 0)
-                                        volume = float(snapshot.get('volume', 0) or 0)
-                                        reason = reason_hint
-                                    slack_ref.send_close_notify(
-                                        ticket=ticket,
-                                        direction=snapshot.get('type', 'UNKNOWN'),
-                                        volume=volume,
-                                        price=price,
-                                        profit=profit,
-                                        magic=snapshot.get('magic', 0),
-                                        reason=reason
-                                    )
-                                except Exception:
-                                    pass
-                            threading.Thread(target=deferred_close_notify, args=(client, slack_notifier, pos['ticket'], pos, "SL"), daemon=True).start()
                             
                             total_pnl_achieved += pos['profit']
                             total_closed += 1
@@ -723,37 +625,20 @@ def main():
                             
                             if resp and resp.get('success'):
                                 print(f"    SUCCESS!")
-                                # Mark as explicitly closed early to avoid duplicate auto-close detection
+                                # Gui Slack notification
+                                slack_notifier.send_close_notify(
+                                    ticket=pos['ticket'],
+                                    direction=pos.get('type', 'UNKNOWN'),
+                                    volume=pos.get('volume', 0),
+                                    price=pos.get('price_open', 0),
+                                    profit=pos['profit'],
+                                    magic=pos.get('magic', 0),
+                                    reason="BATCH"
+                                )
+                                
+                                # Track as explicitly closed
                                 confirmed_closed_tickets.add(pos['ticket'])
                                 processed_closed_tickets.add(pos['ticket'])
-
-                                # Defer Slack notification briefly and fetch accurate P&L from history
-                                def deferred_close_notify(client_ref, slack_ref, ticket, snapshot, reason_hint="BATCH", delay=1.5):
-                                    try:
-                                        time.sleep(delay)
-                                        hist = fetch_close_info(client_ref, ticket, timeout=4, poll_interval=0.5)
-                                        if hist:
-                                            profit = hist.get('profit', float(snapshot.get('profit', 0) or 0))
-                                            price = hist.get('price', float(snapshot.get('price_open', 0) or 0))
-                                            volume = hist.get('volume', float(snapshot.get('volume', 0) or 0))
-                                            reason = hist.get('reason') or reason_hint
-                                        else:
-                                            profit = float(snapshot.get('profit', 0) or 0)
-                                            price = float(snapshot.get('price_open', 0) or 0)
-                                            volume = float(snapshot.get('volume', 0) or 0)
-                                            reason = reason_hint
-                                        slack_ref.send_close_notify(
-                                            ticket=ticket,
-                                            direction=snapshot.get('type', 'UNKNOWN'),
-                                            volume=volume,
-                                            price=price,
-                                            profit=profit,
-                                            magic=snapshot.get('magic', 0),
-                                            reason=reason
-                                        )
-                                    except Exception:
-                                        pass
-                                threading.Thread(target=deferred_close_notify, args=(client, slack_notifier, pos['ticket'], pos, "BATCH"), daemon=True).start()
 
                                 total_pnl_achieved += pos['profit']
                                 total_closed += 1

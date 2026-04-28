@@ -164,8 +164,12 @@ struct Args {
         auto_reload_optimized_config: bool,
 
                 /// Seconds between optimizer reload checks
-        #[arg(long, default_value_t = 60)]
-        optimizer_reload_sec: u64,
+                #[arg(long, default_value_t = 60)]
+                optimizer_reload_sec: u64,
+
+                /// Seconds between status messages sent to Slack (recommended 10-15s)
+                #[arg(long, default_value_t = 15)]
+                status_interval_sec: u64,
 
         /// Force apply a loose starter config at launch (useful for demo/testing)
         #[arg(long, default_value_t = false)]
@@ -1130,8 +1134,37 @@ fn main() {
                     _ => "EMA=---".to_string(),
                 };
                 let rsi_str = state.rsi.map(|r| format!("RSI={:.1}", r)).unwrap_or_else(|| "RSI=---".to_string());
-                let atr_str = state.atr.map(|a| format!("ATR={:.3}", a)).unwrap_or_else(|| "ATR=---".to_string());
+                                let atr_str = state.atr.map(|a| format!("ATR={:.3}", a)).unwrap_or_else(|| "ATR=---".to_string());
                 
+                // Periodic status: send bot status to Slack every status_interval_sec seconds (independent of signal)
+                let now = Utc::now();
+                if last_status_time.map_or(true, |t| (now - t).num_seconds() >= args.status_interval_sec as i64) {
+                    let trend_status = if state.ema_fast.is_some() && state.ema_slow.is_some() {
+                        if state.ema_fast.unwrap() > state.ema_slow.unwrap() { "📈 Uptrend" } else { "📉 Downtrend" }
+                    } else { "⚪ Flat" };
+
+                    // Last or current candle info
+                    let candle_info = if let Some(c) = last_completed_candle {
+                        format!("LastCandle: t={} O={:.2} H={:.2} L={:.2} C={:.2} V={}", c.time, c.open, c.high, c.low, c.close, c.volume)
+                    } else {
+                        format!("CurrentCandle: t={} O={:.2} H={:.2} L={:.2} C={:.2} V={}", current_candle.time, current_candle.open, current_candle.high, current_candle.low, current_candle.close, current_candle.volume)
+                    };
+
+                    let status_msg = format!(
+                        "Price={:.2} | {} | EMA20/50={} | {} | Ticks={} | {}",
+                        price, trend_status, ema_str, rsi_str, state.ticks_processed, candle_info
+                    );
+
+                    if slack.is_enabled() {
+                        if let Err(e) = slack.send_status(&status_msg) {
+                            warn!("⚠️ Slack status failed: {}", e);
+                        } else {
+                            debug!("Slack status sent");
+                        }
+                    }
+                    last_status_time = Some(now);
+                }
+
                                 match signal.action {
                                         SignalAction::EnterLong | SignalAction::EnterShort => {
                         info!("🚨🚨🚨 SIGNAL {} | score={}/10 conf={:.2} | {} | {} | {} | SL={:.2} TP={:.2}",
@@ -1219,9 +1252,9 @@ fn main() {
                                         }
 
                     SignalAction::Hold => { 
-                                                // Log status every 30 seconds to show engine is alive
-                        let now = Utc::now();
-                        if last_status_time.map_or(true, |t| (now - t).num_seconds() >= 30) {
+                                                // Log status every status_interval_sec seconds to show engine is alive
+                                                let now = Utc::now();
+                                                if last_status_time.map_or(true, |t| (now - t).num_seconds() >= args.status_interval_sec as i64) {
                             let trend_status = if state.ema_fast.is_some() && state.ema_slow.is_some() {
                                 if state.ema_fast.unwrap() > state.ema_slow.unwrap() { "📈 Uptrend" } 
                                 else { "📉 Downtrend" }
