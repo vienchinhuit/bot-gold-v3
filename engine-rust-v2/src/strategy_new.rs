@@ -180,7 +180,13 @@ pub struct Config {
     
     // === CONFIRMATION ===
     pub require_confirmation: bool, // If false, skip the one-candle confirmation to increase frequency
-}
+
+    // === MOMENTUM OVERRIDE ===
+    // If true, strong recent candles (relative to ATR) can override sideway EMA filter
+    pub momentum_override_enabled: bool,
+    // Multiplier of ATR to consider a candle 'strong' for override (e.g. 1.0 = body >= ATR)
+    pub momentum_override_mult: f64,
+    }
 
 impl Default for Config {
     fn default() -> Self {
@@ -235,6 +241,9 @@ impl Default for Config {
             
             // Confirmation
             require_confirmation: true,
+            // Momentum override defaults
+            momentum_override_enabled: true,
+            momentum_override_mult: 1.0,
         }
     }
 }
@@ -476,6 +485,41 @@ pub fn calc_atr(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> O
 #[inline]
 pub fn is_sideway(ema_fast: f64, ema_slow: f64, threshold: f64) -> bool {
     (ema_fast - ema_slow).abs() < threshold
+}
+
+/// 1b. MOMENTUM OVERRIDE CHECK
+/// Detects whether recent candles show strong directional momentum (relative to ATR)
+/// that should override a sideway EMA condition. Returns true if override should apply.
+pub fn detect_momentum_override(state: &State, atr: f64, mult: f64) -> bool {
+    // Need at least one completed candle
+    if state.candles.is_empty() { return false; }
+
+    // Check last candle
+    if let Some(last) = state.candles.back() {
+        let body = last.body();
+        if body >= atr * mult {
+            // Strong single candle
+            return true;
+        }
+    }
+
+    // Check last two candles same-direction and combined strength
+    if state.candles.len() >= 2 {
+        let n = state.candles.len();
+        let last = state.candles[n-1];
+        let prev = state.candles[n-2];
+        let body_sum = last.body() + prev.body();
+        // Require both candles to have the same direction (both bullish or both bearish)
+        let dir_last = last.close.partial_cmp(&last.open);
+        let dir_prev = prev.close.partial_cmp(&prev.open);
+        if dir_last.is_some() && dir_prev.is_some() && dir_last == dir_prev {
+            if body_sum >= atr * mult * 1.5 {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// 2. TREND STRENGTH CHECK
@@ -921,7 +965,20 @@ pub fn should_trade(
     // STEP 4: FILTER 1 - Sideway check (MANDATORY)
     // ============================================================
     if is_sideway(ema_fast, ema_slow, cfg.sideway_ema_threshold) {
-        return ret_skip("FILTER: Sideway market (EMA convergence)");
+        // Allow strong momentum to override sideway filter for fast scalping setups
+        if cfg.momentum_override_enabled {
+            if let Some(a) = Some(atr) {
+                if detect_momentum_override(state, a, cfg.momentum_override_mult) {
+                    debug!("SIDEWAY OVERRIDE: strong recent candles detected -> bypass sideway filter");
+                } else {
+                    return ret_skip("FILTER: Sideway market (EMA convergence)");
+                }
+            } else {
+                return ret_skip("FILTER: Sideway market (EMA convergence)");
+            }
+        } else {
+            return ret_skip("FILTER: Sideway market (EMA convergence)");
+        }
     }
     
     // ============================================================

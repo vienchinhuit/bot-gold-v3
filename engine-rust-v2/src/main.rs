@@ -379,6 +379,8 @@ fn main() {
         max_positions_per_direction: 10,
         no_trade_zone_pips: 100.0,
         require_confirmation: args.require_confirmation,
+        momentum_override_enabled: true,
+        momentum_override_mult: 1.0,
         };
 
         // Initialize Slack client early so optimizer can send updates
@@ -442,6 +444,8 @@ fn main() {
                     max_positions_per_direction: 10,
                     no_trade_zone_pips: 100.0,
                     require_confirmation: args.require_confirmation,
+        momentum_override_enabled: true,
+        momentum_override_mult: 1.0,
                 };
 
         // If user requested a loose start, apply loose config regardless of logs
