@@ -172,8 +172,12 @@ struct Args {
                 status_interval_sec: u64,
 
         /// Force apply a loose starter config at launch (useful for demo/testing)
-        #[arg(long, default_value_t = false)]
-        loose_start: bool,
+                #[arg(long, default_value_t = false)]
+                loose_start: bool,
+
+                /// Enable scalping preset: apply aggressive scalping-friendly parameters
+                #[arg(long, default_value_t = false)]
+                scalp_mode: bool,
 
                 /// Log per-tick analysis (debug-level) each tick
         #[arg(long, default_value_t = false)]
@@ -351,7 +355,7 @@ fn main() {
     }
         info!("============================================================");
 
-        let mut config = Config {
+                let mut config = Config {
         ema_fast: 20,
         ema_slow: 50,
         rsi_period: 14,
@@ -383,16 +387,30 @@ fn main() {
         momentum_override_mult: 0.6,
         };
 
+    // Apply 'scalp mode' preset if requested (overrides many conservative defaults)
+    if args.scalp_mode {
+        config.min_score = 1;
+        config.min_confidence = 0.30;
+        config.min_trend_strength = 0.02;
+        config.max_pullback_pips = 60.0;
+        config.max_fomo_pips = 80.0;
+        config.max_candle_mult = 3.0;
+        config.require_confirmation = false;
+        config.momentum_override_mult = 0.6;
+        info!("SCALP MODE ENABLED: applied scalping-friendly presets");
+    }
+
         // Initialize Slack client early so optimizer can send updates
         let slack = SlackClient::new(args.slack_enabled, args.slack_webhook.clone(), args.slack_channel.clone());
 
         // Send immediate startup status to Slack
         if slack.is_enabled() {
-            let startup_msg = format!("Engine STARTED | Symbol={} | Trading={} | LooseStart={} | LogLevel={}",
-                resolved_symbol,
-                if args.trade { "ENABLED" } else { "DISABLED" },
-                args.loose_start,
-                args.log_level);
+            let startup_msg = format!("Engine STARTED | Symbol={} | Trading={} | LooseStart={} | ScalpMode={} | LogLevel={}",
+                            resolved_symbol,
+                            if args.trade { "ENABLED" } else { "DISABLED" },
+                            args.loose_start,
+                            args.scalp_mode,
+                            args.log_level);
             match slack.send_status(&startup_msg) {
                 Ok(_) => info!("Startup notification sent to Slack"),
                 Err(e) => warn!("Failed to send startup Slack notification: {}", e),
@@ -1104,33 +1122,38 @@ fn main() {
 
 
                 
-                                if args.auto_reload_optimized_config {
+                                                                if args.auto_reload_optimized_config {
                                     let now = Utc::now();
                                     if last_heartbeat_time.map_or(true, |t| (now - t).num_seconds() >= args.optimizer_reload_sec as i64) {
-                                                                            if let Some(result) = load_optimization_result(&args.optimizer_output_file) {
-                                                                                config.min_score = result.best_config.min_score;
-                                                                                config.min_confidence = result.best_config.min_confidence;
-                                                                                config.sideway_ema_threshold = result.best_config.sideway_ema_threshold;
-                                                                                config.min_trend_strength = result.best_config.min_trend_strength;
-                                                                                config.max_pullback_pips = result.best_config.max_pullback_pips;
-                                                                                config.max_fomo_pips = result.best_config.max_fomo_pips;
-                                                                                config.max_candle_mult = result.best_config.max_candle_mult;
-                                                                                config.sl_mult = result.best_config.sl_mult;
-                                                                                config.tp_mult = result.best_config.tp_mult;
-                                                                                config.require_confirmation = result.best_config.require_confirmation;
-                                                                                info!("CONFIG RELOADED FROM OPTIMIZER: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}",
-                                                                                    config.min_score,
-                                                                                    config.min_confidence,
-                                                                                    config.sideway_ema_threshold,
-                                                                                    config.min_trend_strength,
-                                                                                    config.max_pullback_pips,
-                                                                                    config.max_fomo_pips,
-                                                                                    config.max_candle_mult,
-                                                                                    config.sl_mult,
-                                                                                    config.tp_mult);
-                                                                            }
-                                                                            last_heartbeat_time = Some(now);
-                                                                        }
+                                        if args.scalp_mode {
+                                            // When scalp_mode is enabled, prefer the scalping presets and skip auto-reload
+                                            info!("SCALP MODE active: skipping auto-reload of optimizer config to preserve scalping presets");
+                                        } else {
+                                            if let Some(result) = load_optimization_result(&args.optimizer_output_file) {
+                                                config.min_score = result.best_config.min_score;
+                                                config.min_confidence = result.best_config.min_confidence;
+                                                config.sideway_ema_threshold = result.best_config.sideway_ema_threshold;
+                                                config.min_trend_strength = result.best_config.min_trend_strength;
+                                                config.max_pullback_pips = result.best_config.max_pullback_pips;
+                                                config.max_fomo_pips = result.best_config.max_fomo_pips;
+                                                config.max_candle_mult = result.best_config.max_candle_mult;
+                                                config.sl_mult = result.best_config.sl_mult;
+                                                config.tp_mult = result.best_config.tp_mult;
+                                                config.require_confirmation = result.best_config.require_confirmation;
+                                                info!("CONFIG RELOADED FROM OPTIMIZER: min_score={} min_conf={:.2} sideway={:.3} trend={:.3} pullback={:.1} fomo={:.1} candle_mult={:.2} sl={:.2} tp={:.2}",
+                                                    config.min_score,
+                                                    config.min_confidence,
+                                                    config.sideway_ema_threshold,
+                                                    config.min_trend_strength,
+                                                    config.max_pullback_pips,
+                                                    config.max_fomo_pips,
+                                                    config.max_candle_mult,
+                                                    config.sl_mult,
+                                                    config.tp_mult);
+                                            }
+                                        }
+                                        last_heartbeat_time = Some(now);
+                                    }
                                 }
 
 
