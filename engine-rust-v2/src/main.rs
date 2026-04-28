@@ -83,7 +83,7 @@ struct Args {
     sideway_threshold: f64,
     
     /// Min trend strength (EMA distance)
-    #[arg(long, default_value_t = 0.10)]
+    #[arg(long, default_value_t = 0.05)]
     min_trend_strength: f64,
     
     /// Max pullback distance from EMA (pips)

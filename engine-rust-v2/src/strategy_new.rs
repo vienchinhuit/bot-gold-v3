@@ -201,7 +201,7 @@ impl Default for Config {
             sideway_ema_threshold: 0.30,  // 30 cents for GOLD
             
             // Trend strength
-            min_trend_strength: 0.20,    // 20 cents minimum
+            min_trend_strength: 0.05,    // 20 cents minimum
             
             // Pullback & FOMO
             max_pullback_pips: 15.0,
@@ -220,7 +220,7 @@ impl Default for Config {
             max_wick_ratio: 0.5,
             
             // Scoring
-            min_score: 5,
+            min_score: 1,
             min_confidence: 0.5,
             
             // Risk
@@ -243,7 +243,7 @@ impl Default for Config {
             require_confirmation: false,
             // Momentum override defaults
             momentum_override_enabled: true,
-            momentum_override_mult: 1.0,
+            momentum_override_mult: 0.8,
         }
     }
 }
