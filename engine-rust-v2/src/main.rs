@@ -950,9 +950,17 @@ fn main() {
 
     
         // Cooldown tracking
-        let mut last_action_time: Option<DateTime<Utc>> = None;
-        let mut last_status_time: Option<DateTime<Utc>> = None;
-        let mut last_heartbeat_time: Option<DateTime<Utc>> = None;
+            let mut last_action_time: Option<DateTime<Utc>> = None;
+            let mut last_status_time: Option<DateTime<Utc>> = None;
+            let mut last_heartbeat_time: Option<DateTime<Utc>> = None;
+
+            // Order rate limiting window to prevent accidental bursts / batch floods
+            // Restrict to MAX_ORDERS_PER_WINDOW orders per WINDOW_SEC seconds
+            let mut orders_window_start: Option<Instant> = None;
+            let mut orders_in_window: usize = 0;
+            const MAX_ORDERS_PER_WINDOW: usize = 20;
+            const WINDOW_SEC: u64 = 1;
+
     
     // ZMQ setup
     let ctx = zmq::Context::new();
@@ -1728,55 +1736,80 @@ fn main() {
                             info!("📤 EXECUTING {} {} lots @ {} | SL={:.5} TP={:.5} (min_stop_req={:.5})",
                                 order_type, args.volume, signal.entry_price, sl_to_send, tp_to_send, min_stop_distance);
 
-                            // Notify Slack about order request
-                            if slack.is_enabled() {
-                                let sl_opt = if sl_to_send > 0.0 { Some(sl_to_send) } else { None };
-                                let tp_opt = if tp_to_send > 0.0 { Some(tp_to_send) } else { None };
-                                if let Err(e) = slack.send_order_request(order_type, args.volume, signal.entry_price, sl_opt, tp_opt, &request_id) {
-                                    warn!("Failed to send order request notification to Slack: {}", e);
+                                                        // Order rate limiting: enforce MAX_ORDERS_PER_WINDOW per WINDOW_SEC
+                            let now_instant = Instant::now();
+                            if let Some(start) = orders_window_start {
+                                if now_instant.duration_since(start).as_secs() >= WINDOW_SEC {
+                                    orders_window_start = Some(now_instant);
+                                    orders_in_window = 0;
                                 }
+                            } else {
+                                orders_window_start = Some(now_instant);
+                                orders_in_window = 0;
                             }
 
-                                                        match sock.send(s.as_bytes(), 0) {
+                            if orders_in_window >= MAX_ORDERS_PER_WINDOW {
+                                info!("⚠️ Order rate limit reached: {} orders in {}s window - skipping order", MAX_ORDERS_PER_WINDOW, WINDOW_SEC);
+                                continue;
+                            }
+                            orders_in_window += 1;
+
+                            match sock.send(s.as_bytes(), 0) {
+
 
                                 Ok(_) => match sock.recv_string(0) {
-                                    Ok(Ok(resp)) => {
+                                                                        Ok(Ok(resp)) => {
                                                         info!("📥 Order response: {}", resp);
-                                                        state.record_trade(signal.entry_price, true);
-                                                        if signal.direction == Direction::Long { state.long_positions += 1; }
-                                                        else if signal.direction == Direction::Short { state.short_positions += 1; }
+                                                        // Parse response JSON and only treat as success if bridge reports success=true
+                                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+                                                            if v.get("success").and_then(|x| x.as_bool()).unwrap_or(false) {
+                                                                // Successful order - update state and notify Slack
+                                                                state.record_trade(signal.entry_price, true);
+                                                                if signal.direction == Direction::Long { state.long_positions += 1; }
+                                                                else if signal.direction == Direction::Short { state.short_positions += 1; }
 
-                                                        let highs_vec: Vec<f64> = state.highs.iter().copied().collect();
-                                                        let lows_vec: Vec<f64> = state.lows.iter().copied().collect();
-                                                        let log_row = make_strategy_row(
-                                                            &resolved_symbol,
-                                                            order_type,
-                                                            signal.entry_price,
-                                                            signal.score,
-                                                            signal.confidence,
-                                                            state.ema_fast.unwrap_or(0.0),
-                                                            state.ema_slow.unwrap_or(0.0),
-                                                            state.rsi.unwrap_or(0.0),
-                                                            state.atr.unwrap_or(0.0),
-                                                            &format!("{:?}", detect_structure(&highs_vec, &lows_vec, 20)),
-                                                            0,
-                                                            0,
-                                                            &signal.reason,
-                                                            "ENTER",
-                                                            None,
-                                                        );
-                                                        let _ = append_strategy_log(&args.live_log_file, &log_row);
-                                        
-                                                        // Send Slack notification for executed order
-                                                        if let Err(e) = slack.send_order_executed(
-                                                            order_type,
-                                                            args.volume,
-                                                            signal.entry_price,
-                                                            &request_id
-                                                        ) {
-                                                            warn!("⚠️ Slack order notification failed: {}", e);
+                                                                let highs_vec: Vec<f64> = state.highs.iter().copied().collect();
+                                                                let lows_vec: Vec<f64> = state.lows.iter().copied().collect();
+                                                                let log_row = make_strategy_row(
+                                                                    &resolved_symbol,
+                                                                    order_type,
+                                                                    signal.entry_price,
+                                                                    signal.score,
+                                                                    signal.confidence,
+                                                                    state.ema_fast.unwrap_or(0.0),
+                                                                    state.ema_slow.unwrap_or(0.0),
+                                                                    state.rsi.unwrap_or(0.0),
+                                                                    state.atr.unwrap_or(0.0),
+                                                                    &format!("{:?}", detect_structure(&highs_vec, &lows_vec, 20)),
+                                                                    0,
+                                                                    0,
+                                                                    &signal.reason,
+                                                                    "ENTER",
+                                                                    None,
+                                                                );
+                                                                let _ = append_strategy_log(&args.live_log_file, &log_row);
+
+                                                                // Send Slack notification for executed order (only on success)
+                                                                if slack.is_enabled() {
+                                                                    if let Err(e) = slack.send_order_executed(
+                                                                        order_type,
+                                                                        args.volume,
+                                                                        signal.entry_price,
+                                                                        &request_id
+                                                                    ) {
+                                                                        warn!("⚠️ Slack order notification failed: {}", e);
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                // Bridge reported failure - log and do NOT notify Slack
+                                                                let err = v.get("error_message").or_else(|| v.get("error")).or_else(|| v.get("comment")).and_then(|x| x.as_str()).unwrap_or("<no error>");
+                                                                warn!("ORDER FAILED from bridge: {}", err);
+                                                            }
+                                                        } else {
+                                                            warn!("ORDER RESPONSE JSON parse failed: {}", resp);
                                                         }
                                                     }
+
 
                                     Ok(Err(_)) => { warn!("⚠️ Non-UTF8 reply"); }
                                     Err(e) => { warn!("⚠️ No reply: {:?}", e); }
