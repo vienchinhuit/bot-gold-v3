@@ -196,8 +196,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             // Indicator periods
-            ema_fast: 20,
-            ema_slow: 50,
+            ema_fast: 8,
+            ema_slow: 20,
             rsi_period: 14,
             atr_period: 14,
             
@@ -1007,7 +1007,8 @@ pub fn should_trade(
     // ============================================================
     // STEP 7: FILTER 3 - Market structure check
     // ============================================================
-    let structure = detect_structure(&highs_slice, &lows_slice, 20);
+    let lookback = if cfg.scalp_mode { 8 } else { 20 };
+    let structure = detect_structure(&highs_slice, &lows_slice, lookback);
     
     let structure_valid = match (direction, structure) {
         (Direction::Long, SwingType::HigherHigh) => true,
