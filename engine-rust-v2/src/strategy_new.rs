@@ -961,11 +961,18 @@ pub fn should_trade(
     // ============================================================
     // STEP 3: Check position limits
     // ============================================================
-    if state.long_positions >= cfg.max_positions_per_direction {
-        return ret_hold("LIMIT: max long positions reached");
-    }
-    if state.short_positions >= cfg.max_positions_per_direction {
-        return ret_hold("LIMIT: max short positions reached");
+    // In scalp mode we allow more aggressive entries and therefore skip
+    // the per-direction max position checks. This must be enabled consciously
+    // via cfg.scalp_mode = true.
+    if cfg.scalp_mode {
+        debug!("SCALP MODE: skipping max position limits for both directions");
+    } else {
+        if state.long_positions >= cfg.max_positions_per_direction {
+            return ret_hold("LIMIT: max long positions reached");
+        }
+        if state.short_positions >= cfg.max_positions_per_direction {
+            return ret_hold("LIMIT: max short positions reached");
+        }
     }
     
     // ============================================================
