@@ -214,13 +214,18 @@ struct Args {
         mt5_bridge_script: String,
 
                 /// Symbol name to request from MT5 bridge (if use_mt5_bridge=true)
-        #[arg(long, default_value = "GOLD")]
-        mt5_symbol: String,
+                #[arg(long, default_value = "GOLD")]
+                mt5_symbol: String,
 
-        /// Maximum total open positions allowed at any time (long+short)
-        #[arg(long, default_value_t = 50)]
-        max_open_positions: usize,
+                /// Maximum total open positions allowed at any time (long+short)
+                #[arg(long, default_value_t = 50)]
+                max_open_positions: usize,
+
+                /// Minimum net TP distance (in pips) above spread & fees to ensure positive net P&L
+                #[arg(long, default_value_t = 1.0)]
+                min_net_pips: f64,
 }
+
 
 
 
@@ -1702,9 +1707,9 @@ fn main() {
                                                                 if (entry - sl_to_send).abs() < min_stop_distance {
                                                                     sl_to_send = entry - min_stop_distance;
                                                                 }
-                                                                // ensure TP is beyond minimum relative to entry (keep ratio)
+                                                                // ensure TP is beyond minimum relative to entry (use ATR-based TP)
                                                                 let sl_dist = (entry - sl_to_send).abs();
-                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                let tp_req = state.atr.unwrap_or(0.0) * config.tp_mult;
                                                                 if (tp_to_send - entry).abs() < tp_req {
                                                                     tp_to_send = entry + tp_req;
                                                                 }
@@ -1715,7 +1720,7 @@ fn main() {
                                                                     sl_to_send = entry + min_stop_distance;
                                                                 }
                                                                 let sl_dist = (sl_to_send - entry).abs();
-                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                let tp_req = state.atr.unwrap_or(0.0) * config.tp_mult;
                                                                 if (entry - tp_to_send).abs() < tp_req {
                                                                     tp_to_send = entry - tp_req;
                                                                 }
@@ -1775,7 +1780,7 @@ fn main() {
 
                                                                                                                         // Now compute TP relative to actual SL distance to keep R:R
                                                                                                                         let sl_dist = (entry - sl_to_send).abs();
-                                                                                                                        let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                                                                        let tp_req = state.atr.unwrap_or(0.0) * config.tp_mult;
                                                                                                                         let mut desired_tp = entry + tp_req + extra;
                                                                                                                         let mut attempt_tp = round_ceil_to_point(desired_tp, point, digits);
                                                                                                                         // Ensure TP is strictly above entry
@@ -1804,7 +1809,7 @@ fn main() {
                                                                                                                         sl_to_send = attempt_sl;
 
                                                                                                                         let sl_dist = (sl_to_send - entry).abs();
-                                                                                                                        let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                                                                        let tp_req = state.atr.unwrap_or(0.0) * config.tp_mult;
                                                                                                                         let mut desired_tp = entry - tp_req - extra;
                                                                                                                         let mut attempt_tp = round_floor_to_point(desired_tp, point, digits);
                                                                                                                         tries = 0;
@@ -1836,21 +1841,43 @@ fn main() {
                                                                                                                     }
                                                                                                                 }
 
+                                                                                                                // Ensure TP accounts for spread and minimum net pips (to cover fees)
+                                                                                                                let spread_pips = if ask > 0.0 && bid > 0.0 { (ask - bid) / pip } else { 0.0 };
+                                                                                                                let entry = signal.entry_price;
+                                                                                                                let sl_pips = ((entry - sl_to_send).abs()) / pip;
+                                                                                                                let mut tp_pips = ((tp_to_send - entry).abs()) / pip;
+                                                                                                                let min_net = args.min_net_pips; // CLI-configurable
+                                                                                                                let tp_atr_pips = (state.atr.unwrap_or(0.0) * config.tp_mult) / pip;
+                                                                                                                let required_pips = tp_atr_pips + min_net + spread_pips;
+                                                                                                                if tp_pips < required_pips {
+                                                                                                                    // Increase TP distance to satisfy required_pips (ATR-based target)
+                                                                                                                    let needed_pips = required_pips;
+                                                                                                                    if signal.direction == Direction::Long {
+                                                                                                                        let desired_tp = entry + needed_pips * pip;
+                                                                                                                        tp_to_send = round_ceil_to_point(desired_tp, point, digits);
+                                                                                                                    } else {
+                                                                                                                        let desired_tp = entry - needed_pips * pip;
+                                                                                                                        tp_to_send = round_floor_to_point(desired_tp, point, digits);
+                                                                                                                    }
+                                                                                                                    debug!("Adjusted TP to ensure net profit: tp_pips_old={:.3} required_pips={:.3} tp_to_send={:.5}", tp_pips, required_pips, tp_to_send);
+                                                                                                                    tp_pips = ((tp_to_send - entry).abs()) / pip;
+                                                                                                                }
 
-                                                        let payload = serde_json::json!({
-                                                            "type": "ORDER_SEND",
-                                                            "data": {
-                                                                "symbol": resolved_symbol,
-                                                                "volume": args.volume,
-                                                                "order_type": order_type,
-                                                                "price": 0,
-                                                                "stop_loss": sl_to_send,
-                                                                "take_profit": tp_to_send,
-                                                                "comment": comment,
-                                                                "magic": 2100,
-                                                                "request_id": request_id
-                                                            }
-                                                        });
+                                                                                                                let payload = serde_json::json!({
+                                                                                                                    "type": "ORDER_SEND",
+                                                                                                                    "data": {
+                                                                                                                        "symbol": resolved_symbol,
+                                                                                                                        "volume": args.volume,
+                                                                                                                        "order_type": order_type,
+                                                                                                                        "price": 0,
+                                                                                                                        "stop_loss": sl_to_send,
+                                                                                                                        "take_profit": tp_to_send,
+                                                                                                                        "comment": comment,
+                                                                                                                        "magic": 2100,
+                                                                                                                        "request_id": request_id
+                                                                                                                    }
+                                                                                                                });
+
                             
                                                         let s = payload.to_string();
                             info!("📤 EXECUTING {} {} lots @ {} | SL={:.5} TP={:.5} (min_stop_req={:.5})",
@@ -1865,18 +1892,25 @@ fn main() {
                                 } else { break; }
                             }
 
-                                                        // If there are no open positions currently, reset the rate window
-                            if open_positions == 0 {
-                                if !order_timestamps.is_empty() {
-                                    debug!("No open positions: clearing order rate window ({} entries)", order_timestamps.len());
-                                    order_timestamps.clear();
-                                }
-                            }
+                                                        // If there are no open positions currently (both via bridge and local state), reset the rate window
+                                                        if open_positions == 0 || (state.long_positions + state.short_positions) == 0 {
+                                                            if !order_timestamps.is_empty() {
+                                                                debug!("No open positions (bridge={} local={}) -> clearing order rate window ({} entries)", open_positions, state.long_positions + state.short_positions, order_timestamps.len());
+                                                                order_timestamps.clear();
+                                                            }
+                                                        }
 
-                            if order_timestamps.len() >= MAX_ORDERS_PER_WINDOW {
-                                info!("⚠️ Order rate limit reached: {} orders in {}s window - skipping order (recent_count={})", MAX_ORDERS_PER_WINDOW, WINDOW_SEC, order_timestamps.len());
-                                continue;
-                            }
+                                                        if order_timestamps.len() >= MAX_ORDERS_PER_WINDOW {
+                                                            // Log additional diagnostics: age of oldest timestamp
+                                                            if let Some(oldest) = order_timestamps.front() {
+                                                                let age_ms = Instant::now().duration_since(*oldest).as_millis();
+                                                                info!("⚠️ Order rate limit reached: {} orders in {}s window - skipping order (recent_count={} oldest_age_ms={})", MAX_ORDERS_PER_WINDOW, WINDOW_SEC, order_timestamps.len(), age_ms);
+                                                            } else {
+                                                                info!("⚠️ Order rate limit reached: {} orders in {}s window - skipping order (recent_count={})", MAX_ORDERS_PER_WINDOW, WINDOW_SEC, order_timestamps.len());
+                                                            }
+                                                            continue;
+                                                        }
+
 
 
                                                         match sock.send(s.as_bytes(), 0) {
