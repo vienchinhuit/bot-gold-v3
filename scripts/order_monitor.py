@@ -11,6 +11,7 @@ import json
 import time
 import threading
 import os
+import sys
 import argparse
 from collections import defaultdict
 from datetime import datetime
@@ -37,6 +38,10 @@ except Exception:
 SYMBOL = "GOLD"
 PORT = 5556
 CHECK_INTERVAL = 0.2  # Gian
+# Watchdog timeout (in seconds). If main loop doesn't update heartbeat within this interval,
+# the process will auto-restart. Set to 0 to disable. Default can be overridden by OM_WATCHDOG_TIMEOUT env var
+WATCHDOG_TIMEOUT = int(os.environ.get('OM_WATCHDOG_TIMEOUT', '60'))  # default 60s
+LAST_HEARTBEAT = time.time()
 
 # Slack notification settings (ZMQ PUB)
 SLACK_NOTIFY_PORT = 5557  # Port de gui close notifications den Rust engine (0 = disable)
@@ -130,6 +135,11 @@ class OrderClient:
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.DEALER)
         self.socket.connect(f"tcp://localhost:{port}")
+        # Ensure quick cleanup on restart/close (don't block on close)
+        try:
+            self.socket.setsockopt(zmq.LINGER, 0)
+        except Exception:
+            pass
         self.socket.setsockopt(zmq.RCVTIMEO, 5000)
         
         self._running = True
@@ -415,16 +425,50 @@ def main():
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug prints (overrides OM_DEBUG env var)')
     parser.add_argument('--notify-port', type=int, default=None, help='Override SLACK_NOTIFY_PORT (ZMQ PUB bind)')
     parser.add_argument('--batch-print-sec', type=int, default=5, help='Batch summary interval seconds (0 to disable)')
+    parser.add_argument('--watchdog-timeout', type=int, default=None, help='Watchdog timeout in seconds (override OM_WATCHDOG_TIMEOUT env var, 0 to disable)')
     args = parser.parse_args()
     global OM_DEBUG
     if args.debug:
         OM_DEBUG = True
-    dbg(f"CLI args: debug={args.debug} notify_port={args.notify_port}")
+    dbg(f"CLI args: debug={args.debug} notify_port={args.notify_port} watchdog_timeout={args.watchdog_timeout}")
 
     notify_port = args.notify_port if args.notify_port is not None else SLACK_NOTIFY_PORT
 
+    # Determine watchdog timeout (CLI overrides env)
+    watchdog_timeout = WATCHDOG_TIMEOUT
+    if args.watchdog_timeout is not None:
+        watchdog_timeout = args.watchdog_timeout
+    # Disable if 0 or negative
+    if watchdog_timeout is not None and watchdog_timeout <= 0:
+        watchdog_timeout = 0
+
     client = OrderClient(port=PORT)
     slack_notifier = SlackNotifier(port=notify_port)
+
+    # Start watchdog thread to auto-restart if main loop hangs
+    if watchdog_timeout and watchdog_timeout > 0:
+        import sys
+        def _watchdog_func(c, notifier, timeout):
+            global LAST_HEARTBEAT
+            try:
+                while True:
+                    # Wake up periodically (fraction of the timeout)
+                    time.sleep(max(1.0, timeout / 3.0))
+                    since = time.time() - LAST_HEARTBEAT
+                    if since > timeout:
+                        print(f"[WATCHDOG] No heartbeat for {since:.1f}s (> {timeout}s). Restarting process.")
+                        # Do not close/modify any tracked positions. Only re-exec the process to reset state.
+                        try:
+                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                        except Exception as e:
+                            print(f"[WATCHDOG] execv failed: {e}. Exiting.")
+                            os._exit(3)
+            except Exception as e:
+                dbg(f"Watchdog thread exception: {e}")
+
+        wd_thr = threading.Thread(target=_watchdog_func, args=(client, slack_notifier, watchdog_timeout), daemon=True)
+        wd_thr.start()
+        print(f"Watchdog enabled: timeout={watchdog_timeout}s")
     
     # Reset batch info khi khoi chay
     batch_info = load_batch_info()
@@ -483,6 +527,11 @@ def main():
     try:
         while True:
             positions = get_all_positions(client, SYMBOL)
+            # Update heartbeat so watchdog knows we're alive
+            try:
+                LAST_HEARTBEAT = time.time()
+            except Exception:
+                pass
             
             i += 1
             elapsed = round(i * CHECK_INTERVAL, 1)
