@@ -273,14 +273,23 @@ class OrderWorker:
         """Handle order send request."""
         self._order_logger.info(f"Processing ORDER_SEND: {data}")
         
+        # Parse stop_loss / take_profit carefully: allow explicit 0.0 values.
+        def parse_optional_float(x):
+            if x is None:
+                return None
+            try:
+                return float(x)
+            except Exception:
+                return None
+
         request = OrderRequest(
             ticket=None,
             symbol=data.get('symbol', ''),
             volume=float(data.get('volume', 0)),
             order_type=data.get('order_type', ''),
             price=float(data.get('price', 0)),
-            stop_loss=float(data.get('stop_loss')) if data.get('stop_loss') else None,
-            take_profit=float(data.get('take_profit')) if data.get('take_profit') else None,
+            stop_loss=parse_optional_float(data.get('stop_loss')),
+            take_profit=parse_optional_float(data.get('take_profit')),
             comment=data.get('comment'),
             magic=int(data.get('magic', 0)) if data.get('magic') else None,
             request_id=data.get('request_id', '')
@@ -426,8 +435,17 @@ class OrderWorker:
     def _handle_position_modify(self, data: dict):
         """Handle position modify request."""
         ticket = int(data.get('ticket', 0))
-        stop_loss = float(data.get('stop_loss')) if data.get('stop_loss') else None
-        take_profit = float(data.get('take_profit')) if data.get('take_profit') else None
+        # Parse stop_loss / take_profit carefully to allow zero values
+        def parse_optional_float(x):
+            if x is None:
+                return None
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        stop_loss = parse_optional_float(data.get('stop_loss'))
+        take_profit = parse_optional_float(data.get('take_profit'))
         
         self._order_logger.info(
             f"Processing POSITION_MODIFY: ticket={ticket}, "

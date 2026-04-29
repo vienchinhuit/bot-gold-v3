@@ -400,17 +400,18 @@ fn main() {
         };
 
     // Apply 'scalp mode' preset if requested (overrides many conservative defaults)
-    if args.scalp_mode {
-        config.min_score = 1;
-        config.min_confidence = 0.30;
+        if args.scalp_mode {
+        // Preserve user-provided min_score and min_confidence when scalp_mode is enabled.
+        // Apply only scalping-friendly presets for the other parameters.
         config.min_trend_strength = 0.02;
         config.max_pullback_pips = 60.0;
         config.max_fomo_pips = 80.0;
         config.max_candle_mult = 3.0;
         config.require_confirmation = false;
         config.momentum_override_mult = 0.6;
-        info!("SCALP MODE ENABLED: applied scalping-friendly presets");
+        info!("SCALP MODE ENABLED: applied scalping-friendly presets (min_score/min_confidence preserved from CLI)");
     }
+
 
         // Initialize Slack client early so optimizer can send updates
         let slack = SlackClient::new(args.slack_enabled, args.slack_webhook.clone(), args.slack_channel.clone());
