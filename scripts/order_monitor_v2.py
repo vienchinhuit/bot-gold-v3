@@ -17,6 +17,50 @@ from datetime import datetime
 PORT = 5556
 CHECK_INTERVAL = 1.0  # seconds between polls
 
+SCRIPT_DIR = __import__('os').path.dirname(__import__('os').path.abspath(__file__))
+BATCH_INFO_FILE = __import__('os').path.join(SCRIPT_DIR, 'batch_info.json')
+
+# Batch info helpers
+def load_batch_info():
+    try:
+        import os, json
+        if os.path.exists(BATCH_INFO_FILE):
+            with open(BATCH_INFO_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_batch_info(batch_info):
+    try:
+        import os, json
+        os.makedirs(os.path.dirname(BATCH_INFO_FILE), exist_ok=True)
+        with open(BATCH_INFO_FILE, 'w', encoding='utf-8') as f:
+            json.dump(batch_info, f, indent=2)
+    except Exception:
+        pass
+
+
+def update_batch_closed_info(batch_info, magic, closed_count, closed_pnl):
+    magic_str = str(magic)
+    if magic_str not in batch_info:
+        batch_info[magic_str] = {}
+    batch_info[magic_str]['closed_count'] = batch_info[magic_str].get('closed_count', 0) + closed_count
+    batch_info[magic_str]['closed_pnl'] = batch_info[magic_str].get('closed_pnl', 0.0) + closed_pnl
+    save_batch_info(batch_info)
+    return batch_info
+
+
+def clear_batch_closed_info(batch_info, magic):
+    magic_str = str(magic)
+    if magic_str in batch_info:
+        batch_info[magic_str]['closed_count'] = 0
+        batch_info[magic_str]['closed_pnl'] = 0.0
+        save_batch_info(batch_info)
+    return batch_info
+
+
 
 class OrderClient:
     def __init__(self, port=5556):
@@ -125,34 +169,73 @@ def main():
     total_closed = 0
     total_pnl = 0.0
 
+    # load batch_info to include closed pnl per magic
+    batch_info = load_batch_info()
+
     try:
         while True:
             positions = get_all_positions(client)
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             if positions:
-                print(f"[{now}] Found {len(positions)} open position(s)")
+
+                # Group positions by magic (batch)
+                groups = {}
                 for p in positions:
-                    try:
-                        profit = float(p.get('profit', 0) or 0)
-                    except Exception:
-                        profit = 0.0
+                    magic = p.get('magic', 0)
+                    groups.setdefault(magic, []).append(p)
 
-                    print("  ", fmt_pos(p))
+                print(f"[{now}] Found {len(positions)} open position(s) in {len(groups)} batch(es)")
+                # Print one line per batch summarizing positions
+                for magic, grp in groups.items():
+                    count = len(grp)
+                    total_pnl_batch = 0.0
+                    tickets_summary = []
+                    for p in grp:
+                        try:
+                            pf = float(p.get('profit', 0) or 0)
+                        except Exception:
+                            pf = 0.0
+                        total_pnl_batch += pf
+                        tickets_summary.append(f"#{p.get('ticket')}:{pf:+.2f}")
 
-                    if profit >= pnl_target:
-                        ticket = p.get('ticket')
-                        print(f"    -> Closing position #{ticket} (P&L={profit:+.2f} >= {pnl_target:.2f})...")
-                        resp = close_position(client, ticket)
-                        if resp and resp.get('success'):
-                            print(f"       CLOSED: #{ticket}")
-                            total_closed += 1
-                            total_pnl += profit
-                        else:
-                            err = resp.get('error_message') if resp else 'no response'
-                            print(f"       FAILED to close #{ticket}: {err}")
+                    # read closed pnl/count for this magic from batch_info
+                    closed_info = batch_info.get(str(magic), {}) if batch_info else {}
+                    closed_count = closed_info.get('closed_count', 0)
+                    closed_pnl = closed_info.get('closed_pnl', 0.0)
+
+                    line = (
+                        f"  Magic={magic} | count={count} | open_pnl={total_pnl_batch:+.2f} "
+                        f"| closed_pnl={closed_pnl:+.2f} closed_count={closed_count} "
+                        f"| tickets=[{', '.join(tickets_summary)}]"
+                    )
+                    print(line)
+
+
+                    # For any individual position within this batch that meets pnl_target, close it
+                    for p in grp:
+                        try:
+                            profit = float(p.get('profit', 0) or 0)
+                        except Exception:
+                            profit = 0.0
+
+                        if profit >= pnl_target:
+                            ticket = p.get('ticket')
+                            print(f"    -> Closing position #{ticket} (P&L={profit:+.2f} >= {pnl_target:.2f})...")
+                            resp = close_position(client, ticket)
+                            if resp and resp.get('success'):
+                                print(f"       CLOSED: #{ticket}")
+                                total_closed += 1
+                                total_pnl += profit
+                                # update batch_info for this magic
+                                batch_info = update_batch_closed_info(batch_info, magic, 1, profit)
+                            else:
+                                err = resp.get('error_message') if resp else 'no response'
+                                print(f"       FAILED to close #{ticket}: {err}")
+
             else:
                 print(f"[{now}] No open positions.")
+
 
             time.sleep(interval)
 
