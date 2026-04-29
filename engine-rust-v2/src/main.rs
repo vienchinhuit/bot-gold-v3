@@ -385,6 +385,7 @@ fn main() {
         require_confirmation: args.require_confirmation,
         momentum_override_enabled: true,
         momentum_override_mult: 0.6,
+        scalp_mode: args.scalp_mode,
         };
 
     // Apply 'scalp mode' preset if requested (overrides many conservative defaults)
@@ -464,6 +465,7 @@ fn main() {
                     require_confirmation: args.require_confirmation,
         momentum_override_enabled: true,
         momentum_override_mult: 0.6,
+        scalp_mode: args.scalp_mode,
                 };
 
         // If user requested a loose start, apply loose config regardless of logs

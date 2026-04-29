@@ -186,6 +186,10 @@ pub struct Config {
     pub momentum_override_enabled: bool,
     // Multiplier of ATR to consider a candle 'strong' for override (e.g. 1.0 = body >= ATR)
     pub momentum_override_mult: f64,
+
+    // === SCALP MODE FLAG ===
+    // When true, several filters are relaxed to favor higher-frequency scalping
+    pub scalp_mode: bool,
     }
 
 impl Default for Config {
@@ -244,6 +248,9 @@ impl Default for Config {
             // Momentum override defaults
             momentum_override_enabled: true,
             momentum_override_mult: 0.6, // make momentum override easier to trigger
+
+            // Scalp mode default
+            scalp_mode: false,
         }
     }
 }
@@ -1011,9 +1018,15 @@ pub fn should_trade(
     };
     
     let structure_soft_penalty = if structure_valid { 0 } else { -1 };
-    let (reversal_penalty, reversal_reason) = detect_reversal_risk(current_candle, state, direction, cfg);
+    let (mut reversal_penalty, reversal_reason) = detect_reversal_risk(current_candle, state, direction, cfg);
     if reversal_penalty <= -3 {
-        return ret_skip(&format!("FILTER: reversal risk too high ({})", reversal_reason));
+        if cfg.scalp_mode {
+            // In scalp mode be more permissive: cap severe reversal penalty to -1 instead of skipping
+            debug!("SCALP MODE: capping reversal penalty {} -> -1", reversal_penalty);
+            reversal_penalty = -1;
+        } else {
+            return ret_skip(&format!("FILTER: reversal risk too high ({})", reversal_reason));
+        }
     }
     
     // ============================================================
@@ -1021,7 +1034,8 @@ pub fn should_trade(
     // ============================================================
     if !is_pullback(price, ema_fast, cfg.max_pullback_pips, cfg.pip_value) {
         let dist = (price - ema_fast).abs() / cfg.pip_value;
-        if dist > cfg.max_pullback_pips * 3.0 {
+        let multiplier = if cfg.scalp_mode { 4.0 } else { 3.0 };
+        if dist > cfg.max_pullback_pips * multiplier {
             return ret_skip(&format!(
                 "FILTER: Too far from EMA ({:.1} pips)",
                 dist
@@ -1065,28 +1079,40 @@ pub fn should_trade(
     match direction {
         Direction::Long => {
             if rsi >= cfg.rsi_overbought {
-                return ret_skip(&format!(
-                    "FILTER: RSI {:.1} in overbought zone",
-                    rsi
-                ));
+                if cfg.scalp_mode {
+                    debug!("SCALP MODE: allowing RSI overbought {:.1}", rsi);
+                } else {
+                    return ret_skip(&format!(
+                        "FILTER: RSI {:.1} in overbought zone",
+                        rsi
+                    ));
+                }
             }
         }
         Direction::Short => {
             if rsi <= cfg.rsi_oversold {
-                return ret_skip(&format!(
-                    "FILTER: RSI {:.1} in oversold zone",
-                    rsi
-                ));
+                if cfg.scalp_mode {
+                    debug!("SCALP MODE: allowing RSI oversold {:.1}", rsi);
+                } else {
+                    return ret_skip(&format!(
+                        "FILTER: RSI {:.1} in oversold zone",
+                        rsi
+                    ));
+                }
             }
         }
         Direction::None => return ret_hold("No direction determined"),
     }
     
     if !rsi_ok {
-        return ret_skip(&format!(
-            "FILTER: RSI confirmation failed (current: {:.1})",
-            rsi
-        ));
+        if cfg.scalp_mode {
+            debug!("SCALP MODE: bypassing RSI confirmation (current: {:.1})", rsi);
+        } else {
+            return ret_skip(&format!(
+                "FILTER: RSI confirmation failed (current: {:.1})",
+                rsi
+            ));
+        }
     }
     
     // ============================================================
@@ -1100,7 +1126,11 @@ pub fn should_trade(
     );
     
     if !vol_ok {
-        return ret_skip(&format!("FILTER: {}", vol_reason));
+        if cfg.scalp_mode {
+            debug!("SCALP MODE: ignoring volatility filter: {}", vol_reason);
+        } else {
+            return ret_skip(&format!("FILTER: {}", vol_reason));
+        }
     }
     
     // ============================================================
