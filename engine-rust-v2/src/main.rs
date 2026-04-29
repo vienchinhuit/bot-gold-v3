@@ -213,10 +213,15 @@ struct Args {
         #[arg(long, default_value = "python_bridge/mt5_bridge.py")]
         mt5_bridge_script: String,
 
-        /// Symbol name to request from MT5 bridge (if use_mt5_bridge=true)
+                /// Symbol name to request from MT5 bridge (if use_mt5_bridge=true)
         #[arg(long, default_value = "GOLD")]
         mt5_symbol: String,
+
+        /// Maximum total open positions allowed at any time (long+short)
+        #[arg(long, default_value_t = 20)]
+        max_open_positions: usize,
 }
+
 
 
 
@@ -1577,12 +1582,20 @@ fn main() {
                                 continue;
                             }
                             
-                            let total_volume = ((state.long_positions + state.short_positions) as f64) * args.volume;
+                                                        let total_volume = ((state.long_positions + state.short_positions) as f64) * args.volume;
                             if total_volume >= args.max_total_volume {
                                 info!("⏳ TOTAL VOLUME LIMIT: Using {:.2}/{} lots max",
                                     total_volume, args.max_total_volume);
                                 continue;
                             }
+
+                            // Enforce maximum number of concurrently open positions (long + short)
+                            let open_positions = state.long_positions + state.short_positions;
+                            if open_positions >= args.max_open_positions {
+                                info!("⏳ POSITION LIMIT: {} open positions >= max {} -> skipping order", open_positions, args.max_open_positions);
+                                continue;
+                            }
+
                             
                             let order_type = match signal.direction {
                                 Direction::Long => "BUY",

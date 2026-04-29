@@ -164,7 +164,7 @@ class MT5Connector:
             return []
     
     def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get symbol information."""
+        """Get symbol information (robustly)."""
         info = mt5.symbol_info(symbol)
         
         if info is None:
@@ -173,30 +173,60 @@ class MT5Connector:
         # Try to fetch stop level if available on this platform/terminal
         stop_level = None
         try:
-            # Common attribute names may vary by platform/version
             stop_level = getattr(info, 'trade_stops_level', None) or getattr(info, 'stoplevel', None) or getattr(info, 'stop_level', None)
         except Exception:
             stop_level = None
 
-        return {
-            'symbol': info.name,
-            'bid': info.bid,
-            'ask': info.ask,
-            'last': info.last,
-            'volume': info.volume,
-            'high': info.high,
-            'low': info.low,
-            'spread': info.spread,
-            'digits': info.digits,
-            'point': info.point,
-            'tick_value': info.trade_tick_value,
-            'tick_size': info.trade_tick_size,
-            'contract_size': info.trade_contract_size,
-            'volume_min': info.volume_min,
-            'volume_max': info.volume_max,
-            'volume_step': info.volume_step,
-            'stop_level': float(stop_level) if stop_level is not None else None,
+        # Safely extract attributes (some terminals/platforms may miss certain fields)
+        def safe(attr, default=None):
+            try:
+                return getattr(info, attr)
+            except Exception:
+                return default
+
+        # Convert numeric values to plain Python types and handle missing values
+        try:
+            point = float(safe('point', 0.0) or 0.0)
+        except Exception:
+            point = 0.0
+        try:
+            digits = int(safe('digits', 2) or 2)
+        except Exception:
+            digits = 2
+
+        def to_float(x):
+            try:
+                return float(x) if x is not None else None
+            except Exception:
+                return None
+
+        def to_int(x):
+            try:
+                return int(x) if x is not None else None
+            except Exception:
+                return None
+
+        result = {
+            'symbol': safe('name', symbol),
+            'bid': to_float(safe('bid')),
+            'ask': to_float(safe('ask')),
+            'last': to_float(safe('last')),
+            'volume': to_float(safe('volume')),
+            'high': to_float(safe('high')),
+            'low': to_float(safe('low')),
+            'spread': to_float(safe('spread')),
+            'digits': digits,
+            'point': point,
+            'tick_value': to_float(safe('trade_tick_value')),
+            'tick_size': to_float(safe('trade_tick_size')),
+            'contract_size': to_float(safe('trade_contract_size')),
+            'volume_min': to_float(safe('volume_min')),
+            'volume_max': to_float(safe('volume_max')),
+            'volume_step': to_float(safe('volume_step')),
+            'stop_level': to_float(stop_level) if stop_level is not None else None,
         }
+
+        return result
     
     def send_order(self, request: OrderRequest) -> OrderResponse:
         """Send trading order to MT5."""
