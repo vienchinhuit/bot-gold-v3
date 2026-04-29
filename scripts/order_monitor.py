@@ -99,60 +99,30 @@ class SlackNotifier:
                 self.socket = None
     
     def send_close_notify(self, ticket, direction, volume, price, profit, magic, reason="MANUAL"):
-        """Gui notification khi position duoc dong.
-        
-        Args:
-            ticket: Position ticket
-            direction: BUY/SELL
-            volume: Lot size
-            price: Open price
-            profit: Realized P&L
-            magic: Magic number
-            reason: CLOSE_REASON - MANUAL, TP, SL, BATCH
+        """Publish close notification via ZMQ PUB only (no direct Slack webhook).
+        Message format: CLOSE_NOTIFY|ticket|direction|volume|price|profit|magic|reason
         """
-        # Format message
         msg = f"CLOSE_NOTIFY|{ticket}|{direction}|{volume}|{price}|{profit}|{magic}|{reason}"
-
-        # If we have a PUB socket, publish via ZMQ (preferred)
         if self.socket:
             try:
                 self.socket.send_string(msg)
                 reason_label = "TP" if reason == "TP" else ("SL" if reason == "SL" else ("BATCH" if reason == "BATCH" else "CLOSE"))
-                print(f"  [SLACK] Notified #{ticket} {direction} {volume} lots @{price} P&L=${profit:+.2f} [{reason_label}]")
-                return
+                print(f"  [NOTIFY] Published CLOSE_NOTIFY #{ticket} {direction} {volume} @{price} P&L=${profit:+.2f} [{reason_label}]")
             except Exception as e:
-                print(f"  [SLACK] Failed to send ZMQ notify: {e}")
+                print(f"  [NOTIFY] Failed to publish CLOSE_NOTIFY: {e}")
+        else:
+            print(f"  [NOTIFY] No PUB socket available to publish CLOSE_NOTIFY for #{ticket}")
 
     def send_status(self, text: str):
-        """Send periodic monitor status via ZMQ PUB. Message format prefixed with MONITOR_STATUS|"""
+        """Publish periodic monitor status via ZMQ PUB only. Prefix: MONITOR_STATUS|"""
         if self.socket:
             try:
                 self.socket.send_string(f"MONITOR_STATUS|{text}")
-            except Exception:
-                pass
-
-        # Fallback: send directly to Slack webhook if provided via environment variable
-        webhook = os.environ.get('SLACK_WEBHOOK', '').strip()
-        channel = os.environ.get('SLACK_CHANNEL', '').strip()
-        if webhook:
-            try:
-                # Build simple Slack payload (use default channel if channel not prefixed)
-                payload = {
-                    "text": text,
-                }
-                # If channel looks like '#... or @...', include it
-                if channel and (channel.startswith('#') or channel.startswith('@')):
-                    payload['channel'] = channel
-                import requests
-                resp = requests.post(webhook, json=payload, timeout=10)
-                if resp.status_code >= 200 and resp.status_code < 300:
-                    print(f"  [SLACK] Direct webhook sent ({resp.status_code})")
-                else:
-                    print(f"  [SLACK] Direct webhook failed: {resp.status_code} {resp.text}")
             except Exception as e:
-                print(f"  [SLACK] Direct webhook exception: {e}")
+                print(f"  [NOTIFY] Failed to publish MONITOR_STATUS: {e}")
         else:
-            print(f"  [SLACK] No ZMQ socket and no SLACK_WEBHOOK env var - cannot send status")
+            # No PUB socket - print to stdout but do not attempt webhook
+            print(f"  [NOTIFY] Status: {text}")
     
     def close(self):
         if self.socket:
