@@ -179,15 +179,7 @@ struct Args {
                 #[arg(long, default_value_t = false)]
                 scalp_mode: bool,
 
-                /// When scalp_mode is enabled, override SL distance (in pips)
-                #[arg(long, default_value_t = 150.0)]
-                scalp_sl_pips: f64,
-
-                /// When scalp_mode is enabled, override TP distance (in pips)
-                #[arg(long, default_value_t = 200.0)]
-                scalp_tp_pips: f64,
-
-                /// Log per-tick analysis (debug-level) each tick
+                                /// Log per-tick analysis (debug-level) each tick
         #[arg(long, default_value_t = false)]
         per_tick_log: bool,
 
@@ -357,9 +349,7 @@ fn main() {
         args.sideway_threshold, args.min_trend_strength, args.max_pullback_pips, args.max_fomo_pips);
                 info!("Risk: SL={}*ATR | TP={}*ATR | MinScore={} | MinConf={:.2}",
         args.sl_mult, args.tp_mult, args.min_score, args.min_confidence);
-    if args.scalp_mode {
-        info!("SCALP MODE OVERRIDES: SL={} pips | TP={} pips", args.scalp_sl_pips, args.scalp_tp_pips);
-    }
+    
     info!("Volume: {}-{} lots/trade | MaxTotal={} lots",
         args.volume, args.max_volume_per_trade, args.max_total_volume);
         info!("Cooldown: {} candles | MaxLosses={} | Pause={}min",
@@ -1192,24 +1182,7 @@ fn main() {
                                                                 // RUN STRATEGY
                                 let mut signal = should_trade(&mut state, price, bid, ask, &current_candle, &config);
 
-                                // If scalp_mode CLI override is enabled, force fixed SL/TP distances in pips
-                                if args.scalp_mode {
-                                    let pip = config.pip_value;
-                                    let entry = signal.entry_price;
-                                    if signal.is_enter() {
-                                        match signal.direction {
-                                            Direction::Long => {
-                                                signal.stop_loss = entry - args.scalp_sl_pips * pip;
-                                                signal.take_profit = entry + args.scalp_tp_pips * pip;
-                                            }
-                                            Direction::Short => {
-                                                signal.stop_loss = entry + args.scalp_sl_pips * pip;
-                                                signal.take_profit = entry - args.scalp_tp_pips * pip;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
+                                
 
                 
                 // Always log signal status
@@ -1739,10 +1712,10 @@ fn main() {
                                                                 }
                                                                 // ensure TP is beyond minimum relative to entry (use ATR-based TP)
                                                                 let sl_dist = (entry - sl_to_send).abs();
-                                                                let tp_req = state.atr.unwrap_or(0.0) * config.tp_mult;
-                                                                if (tp_to_send - entry).abs() < tp_req {
-                                                                    tp_to_send = entry + tp_req;
-                                                                }
+                                                                                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                                                                                if (tp_to_send - entry).abs() < tp_req {
+                                                                                                                                    tp_to_send = entry + tp_req;
+                                                                                                                                }
                                                             }
                                                             Direction::Short => {
                                                                 let entry = signal.entry_price;
@@ -1750,10 +1723,10 @@ fn main() {
                                                                     sl_to_send = entry + min_stop_distance;
                                                                 }
                                                                 let sl_dist = (sl_to_send - entry).abs();
-                                                                let tp_req = state.atr.unwrap_or(0.0) * config.tp_mult;
-                                                                if (entry - tp_to_send).abs() < tp_req {
-                                                                    tp_to_send = entry - tp_req;
-                                                                }
+                                                                                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                                                                                if (entry - tp_to_send).abs() < tp_req {
+                                                                                                                                    tp_to_send = entry - tp_req;
+                                                                                                                                }
                                                             }
                                                             _ => {}
                                                         }
@@ -1810,17 +1783,17 @@ fn main() {
 
                                                                                                                         // Now compute TP relative to actual SL distance to keep R:R
                                                                                                                         let sl_dist = (entry - sl_to_send).abs();
-                                                                                                                        let tp_req = state.atr.unwrap_or(0.0) * config.tp_mult;
-                                                                                                                        let mut desired_tp = entry + tp_req + extra;
-                                                                                                                        let mut attempt_tp = round_ceil_to_point(desired_tp, point, digits);
-                                                                                                                        // Ensure TP is strictly above entry
-                                                                                                                        tries = 0;
-                                                                                                                        while (attempt_tp - entry) < 1e-9 && tries < 10 {
-                                                                                                                            desired_tp += point;
-                                                                                                                            attempt_tp = round_ceil_to_point(desired_tp, point, digits);
-                                                                                                                            tries += 1;
-                                                                                                                        }
-                                                                                                                        tp_to_send = attempt_tp;
+                                                                                                                                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                                                                                                                                let mut desired_tp = entry + tp_req + extra;
+                                                                                                                                                                                let mut attempt_tp = round_ceil_to_point(desired_tp, point, digits);
+                                                                                                                                                                                // Ensure TP is strictly above entry
+                                                                                                                                                                                tries = 0;
+                                                                                                                                                                                while (attempt_tp - entry) < 1e-9 && tries < 10 {
+                                                                                                                                                                                    desired_tp += point;
+                                                                                                                                                                                    attempt_tp = round_ceil_to_point(desired_tp, point, digits);
+                                                                                                                                                                                    tries += 1;
+                                                                                                                                                                                }
+                                                                                                                                                                                tp_to_send = attempt_tp;
                                                                                                                     }
                                                                                                                     Direction::Short => {
                                                                                                                         let entry = signal.entry_price;
@@ -1839,16 +1812,16 @@ fn main() {
                                                                                                                         sl_to_send = attempt_sl;
 
                                                                                                                         let sl_dist = (sl_to_send - entry).abs();
-                                                                                                                        let tp_req = state.atr.unwrap_or(0.0) * config.tp_mult;
-                                                                                                                        let mut desired_tp = entry - tp_req - extra;
-                                                                                                                        let mut attempt_tp = round_floor_to_point(desired_tp, point, digits);
-                                                                                                                        tries = 0;
-                                                                                                                        while (entry - attempt_tp) < 1e-9 && tries < 10 {
-                                                                                                                            desired_tp -= point;
-                                                                                                                            attempt_tp = round_floor_to_point(desired_tp, point, digits);
-                                                                                                                            tries += 1;
-                                                                                                                        }
-                                                                                                                        tp_to_send = attempt_tp;
+                                                                                                                                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                                                                                                                                let mut desired_tp = entry - tp_req - extra;
+                                                                                                                                                                                let mut attempt_tp = round_floor_to_point(desired_tp, point, digits);
+                                                                                                                                                                                tries = 0;
+                                                                                                                                                                                while (entry - attempt_tp) < 1e-9 && tries < 10 {
+                                                                                                                                                                                    desired_tp -= point;
+                                                                                                                                                                                    attempt_tp = round_floor_to_point(desired_tp, point, digits);
+                                                                                                                                                                                    tries += 1;
+                                                                                                                                                                                }
+                                                                                                                                                                                tp_to_send = attempt_tp;
                                                                                                                     }
                                                                                                                     _ => {}
                                                                                                                 }
@@ -1876,11 +1849,11 @@ fn main() {
                                                                                                                 let entry = signal.entry_price;
                                                                                                                 let sl_pips = ((entry - sl_to_send).abs()) / pip;
                                                                                                                 let mut tp_pips = ((tp_to_send - entry).abs()) / pip;
+                                                                                                                let required_ratio = config.tp_mult / config.sl_mult;
                                                                                                                 let min_net = args.min_net_pips; // CLI-configurable
-                                                                                                                let tp_atr_pips = (state.atr.unwrap_or(0.0) * config.tp_mult) / pip;
-                                                                                                                let required_pips = tp_atr_pips + min_net + spread_pips;
+                                                                                                                let required_pips = sl_pips * required_ratio + min_net + spread_pips;
                                                                                                                 if tp_pips < required_pips {
-                                                                                                                    // Increase TP distance to satisfy required_pips (ATR-based target)
+                                                                                                                    // Increase TP distance to satisfy required_pips
                                                                                                                     let needed_pips = required_pips;
                                                                                                                     if signal.direction == Direction::Long {
                                                                                                                         let desired_tp = entry + needed_pips * pip;
