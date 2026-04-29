@@ -36,10 +36,45 @@ except Exception:
 # Cau hinh
 SYMBOL = "GOLD"
 PORT = 5556
-CHECK_INTERVAL = 0.2  # Gian
+CHECK_INTERVAL = 0.2  # Poll interval for positions (seconds)
+
+# Status publish interval (seconds) - default 1s as requested
+STATUS_INTERVAL = 1.0
 
 # Slack notification settings (ZMQ PUB)
 SLACK_NOTIFY_PORT = 5557  # Port de gui close notifications den Rust engine (0 = disable)
+
+# Auto add stops behavior
+AUTO_ADD_STOPS = True
+# Default stops in pips (can be overridden via CLI)
+DEFAULT_SL_PIPS = 60.0   # 60 pips -> with pip_value 0.01 => 0.60 price
+DEFAULT_TP_PIPS = 120.0  # 120 pips
+PIP_VALUE = 0.01
+
+# If true, only add missing SL/TP (if missing or zero)
+ADD_STOPS_IF_MISSING_ONLY = True
+
+# SL calculation defaults
+SL_MULT = 1.2
+ATR_PERIOD = 14
+HISTORY_COUNT = 100
+
+# ATR helper
+def calc_atr(highs, lows, closes, period):
+    try:
+        if len(highs) < period + 1 or len(lows) < period + 1 or len(closes) < period + 1:
+            return None
+        tr_sum = 0.0
+        for i in range(1, period + 1):
+            idx = len(highs) - period - 1 + i
+            high_low = highs[idx] - lows[idx]
+            high_close = abs(highs[idx] - closes[idx - 1])
+            low_close = abs(lows[idx] - closes[idx - 1])
+            tr = max(high_low, high_close, low_close)
+            tr_sum += tr
+        return tr_sum / float(period)
+    except Exception:
+        return None
 
 
 class SlackNotifier:
@@ -87,6 +122,14 @@ class SlackNotifier:
                 return
             except Exception as e:
                 print(f"  [SLACK] Failed to send ZMQ notify: {e}")
+
+    def send_status(self, text: str):
+        """Send periodic monitor status via ZMQ PUB. Message format prefixed with MONITOR_STATUS|"""
+        if self.socket:
+            try:
+                self.socket.send_string(f"MONITOR_STATUS|{text}")
+            except Exception:
+                pass
 
         # Fallback: send directly to Slack webhook if provided via environment variable
         webhook = os.environ.get('SLACK_WEBHOOK', '').strip()
@@ -414,11 +457,27 @@ def main():
     parser = argparse.ArgumentParser(description='Order Monitor')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug prints (overrides OM_DEBUG env var)')
     parser.add_argument('--notify-port', type=int, default=None, help='Override SLACK_NOTIFY_PORT (ZMQ PUB bind)')
+    parser.add_argument('--status-interval', type=float, default=None, help='Status publish interval in seconds (default 1.0)')
+    parser.add_argument('--auto-add-stops', action='store_true', help='Automatically add SL/TP to positions missing them')
+    parser.add_argument('--sl-pips', type=float, default=None, help='Default SL in pips to add when missing (default: 60)')
+    parser.add_argument('--tp-pips', type=float, default=None, help='Default TP in pips to add when missing (default: 120)')
+    parser.add_argument('--pip-value', type=float, default=None, help='Pip value for symbol (default 0.01)')
     args = parser.parse_args()
-    global OM_DEBUG
+    global OM_DEBUG, STATUS_INTERVAL, AUTO_ADD_STOPS, DEFAULT_SL_PIPS, DEFAULT_TP_PIPS, PIP_VALUE
     if args.debug:
         OM_DEBUG = True
-    dbg(f"CLI args: debug={args.debug} notify_port={args.notify_port}")
+    if args.status_interval is not None:
+        STATUS_INTERVAL = float(args.status_interval)
+    if args.auto_add_stops:
+        AUTO_ADD_STOPS = True
+    if args.sl_pips is not None:
+        DEFAULT_SL_PIPS = float(args.sl_pips)
+    if args.tp_pips is not None:
+        DEFAULT_TP_PIPS = float(args.tp_pips)
+    if args.pip_value is not None:
+        PIP_VALUE = float(args.pip_value)
+
+    dbg(f"CLI args: debug={args.debug} notify_port={args.notify_port} status_interval={args.status_interval} auto_add_stops={args.auto_add_stops} sl_pips={args.sl_pips} tp_pips={args.tp_pips} pip_value={args.pip_value}")
 
     notify_port = args.notify_port if args.notify_port is not None else SLACK_NOTIFY_PORT
 
@@ -535,6 +594,24 @@ def main():
             
             # === END MISSING POSITION DETECTION ===
             
+            # Send periodic status every STATUS_INTERVAL seconds
+            if i % max(1, int(round(STATUS_INTERVAL / max(CHECK_INTERVAL, 0.0001)))) == 0:
+                try:
+                    # Build simple status string: positions count and summary per magic
+                    magic_groups = defaultdict(list)
+                    for p in positions:
+                        magic_groups[p.get('magic', 0)].append(p)
+                    summary_parts = []
+                    total_positions = len(positions)
+                    summary_parts.append(f"pos={total_positions}")
+                    for magic, grp in magic_groups.items():
+                        pnl = sum(float(x.get('profit',0) or 0.0) for x in grp)
+                        summary_parts.append(f"m{magic}:{len(grp)}@{pnl:+.1f}")
+                    status_text = ";".join(summary_parts)
+                    slack_notifier.send_status(status_text)
+                except Exception:
+                    pass
+
             if positions:
                 # Group positions theo magic number
                 magic_groups = defaultdict(list)
@@ -545,8 +622,80 @@ def main():
                         'profit': p.get('profit', 0),
                         'magic': magic,
                         'type': p.get('type'),
-                        'volume': p.get('volume')
+                        'volume': p.get('volume'),
+                        'price_open': p.get('price_open', 0),
+                        'stop_loss': p.get('stop_loss', 0),
+                        'take_profit': p.get('take_profit', 0)
                     })
+
+                # Optionally auto-add missing SL/TP
+                if AUTO_ADD_STOPS:
+                    for p in positions:
+                        ticket = p.get('ticket')
+                        sl = p.get('stop_loss')
+                        tp = p.get('take_profit')
+                        price_open = float(p.get('price_open', 0) or 0.0)
+                        typ = str(p.get('type', '')).upper()
+
+                        missing_sl = sl is None or float(sl) == 0.0
+                        missing_tp = tp is None or float(tp) == 0.0
+
+                        if missing_sl or missing_tp:
+                            sl_price = None
+                            tp_price = None
+
+                            # Compute TP from fixed pips
+                            tp_offset = DEFAULT_TP_PIPS * PIP_VALUE
+
+                            # Compute SL from ATR * SL_MULT when possible
+                            sl_offset = None
+                            if missing_sl:
+                                try:
+                                    client.send("HISTORY", {"symbol": SYMBOL, "count": HISTORY_COUNT})
+                                    resp = client.get_response(timeout=5)
+                                    if resp and isinstance(resp, list) and len(resp) >= ATR_PERIOD + 1:
+                                        highs = [float(x.get('high', 0) or 0.0) for x in resp]
+                                        lows = [float(x.get('low', 0) or 0.0) for x in resp]
+                                        closes = [float(x.get('close', 0) or 0.0) for x in resp]
+                                        atr_v = calc_atr(highs, lows, closes, ATR_PERIOD)
+                                        if atr_v and atr_v > 0:
+                                            sl_offset = atr_v * SL_MULT
+                                except Exception:
+                                    sl_offset = None
+
+                            # Fallback to pip-based SL if ATR unavailable
+                            if sl_offset is None:
+                                sl_offset = DEFAULT_SL_PIPS * PIP_VALUE
+
+                            if 'BUY' in typ or 'LONG' in typ or typ == '0':
+                                if missing_sl:
+                                    sl_price = price_open - sl_offset
+                                if missing_tp:
+                                    tp_price = price_open + tp_offset
+                            else:
+                                if missing_sl:
+                                    sl_price = price_open + sl_offset
+                                if missing_tp:
+                                    tp_price = price_open - tp_offset
+
+                            modify_payload = {'ticket': ticket}
+                            if sl_price is not None:
+                                modify_payload['stop_loss'] = round(sl_price, 5)
+                            if tp_price is not None:
+                                modify_payload['take_profit'] = round(tp_price, 5)
+
+                            print(f"[AUTO ADD STOPS] Ticket #{ticket} missing SL/TP -> setting SL={modify_payload.get('stop_loss')} TP={modify_payload.get('take_profit')}")
+                            client.send("POSITION_MODIFY", modify_payload)
+                            resp = client.get_response(timeout=5)
+                            if resp:
+                                try:
+                                    j = resp
+                                    if j.get('success'):
+                                        print(f"  [AUTO ADD STOPS] Modify success for #{ticket}")
+                                    else:
+                                        print(f"  [AUTO ADD STOPS] Modify failed for #{ticket}: {j.get('error', j)}")
+                                except Exception:
+                                    print(f"  [AUTO ADD STOPS] Unexpected response for #{ticket}: {resp}")
                 
                 # Doc batch info tu file JSON
                 batch_info = load_batch_info()
