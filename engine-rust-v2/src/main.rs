@@ -1589,12 +1589,38 @@ fn main() {
                                 continue;
                             }
 
-                            // Enforce maximum number of concurrently open positions (long + short)
-                            let open_positions = state.long_positions + state.short_positions;
+                                                        // Enforce maximum number of concurrently open positions (long + short)
+                            // Query python bridge for authoritative current open positions when possible
+                            let mut open_positions: usize = (state.long_positions + state.short_positions) as usize;
+                            let order_info_req = serde_json::json!({ "type": "ORDER_INFO", "data": { "symbol": resolved_symbol } });
+                            if let Err(e) = sock.send(order_info_req.to_string().as_bytes(), 0) {
+                                debug!("Failed to request ORDER_INFO: {:?}", e);
+                            } else {
+                                match sock.recv_string(0) {
+                                    Ok(Ok(resp)) => {
+                                        debug!("ORDER_INFO raw: {}", resp);
+                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
+                                            if v.get("success").and_then(|x| x.as_bool()).unwrap_or(false) {
+                                                if let Some(arr) = v.get("positions").and_then(|x| x.as_array()) {
+                                                    open_positions = arr.len();
+                                                }
+                                            } else if v.get("positions").is_some() {
+                                                // sometimes returned without success wrapper
+                                                if let Some(arr) = v.get("positions").and_then(|x| x.as_array()) {
+                                                    open_positions = arr.len();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => { /* ignore failures and fall back to in-memory count */ }
+                                }
+                            }
+
                             if open_positions >= args.max_open_positions {
                                 info!("⏳ POSITION LIMIT: {} open positions >= max {} -> skipping order", open_positions, args.max_open_positions);
                                 continue;
                             }
+
 
                             
                             let order_type = match signal.direction {
