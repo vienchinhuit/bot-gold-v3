@@ -1050,24 +1050,32 @@ pub fn should_trade(
     let close_pos = (current_candle.close - current_candle.low) / range;
 
     if direction == Direction::Long {
-        if current_candle.close < current_candle.open && wick_ratio > 1.5 {
-            return ret_skip("FILTER: bearish rejection candle - avoid BUY");
-        }
-        if current_candle.upper_wick() > body * 1.0 && close_pos < 0.6 {
-            return ret_skip("FILTER: weak bullish close - possible reversal");
-        }
-        if state.recent_bearish_streak >= 2 && current_candle.close <= current_candle.open {
-            return ret_skip("FILTER: bearish streak with weak candle - avoid BUY");
+        if !cfg.scalp_mode {
+            if current_candle.close < current_candle.open && wick_ratio > 1.5 {
+                return ret_skip("FILTER: bearish rejection candle - avoid BUY");
+            }
+            if current_candle.upper_wick() > body * 1.0 && close_pos < 0.6 {
+                return ret_skip("FILTER: weak bullish close - possible reversal");
+            }
+            if state.recent_bearish_streak >= 2 && current_candle.close <= current_candle.open {
+                return ret_skip("FILTER: bearish streak with weak candle - avoid BUY");
+            }
+        } else {
+            debug!("SCALP MODE: bypassing candle reversal filters for LONG");
         }
     } else if direction == Direction::Short {
-        if current_candle.close > current_candle.open && wick_ratio > 1.5 {
-            return ret_skip("FILTER: bullish rejection candle - avoid SELL");
-        }
-        if current_candle.lower_wick() > body * 1.0 && close_pos > 0.4 {
-            return ret_skip("FILTER: weak bearish close - possible reversal");
-        }
-        if state.recent_bullish_streak >= 2 && current_candle.close >= current_candle.open {
-            return ret_skip("FILTER: bullish streak with weak candle - avoid SELL");
+        if !cfg.scalp_mode {
+            if current_candle.close > current_candle.open && wick_ratio > 1.5 {
+                return ret_skip("FILTER: bullish rejection candle - avoid SELL");
+            }
+            if current_candle.lower_wick() > body * 1.0 && close_pos > 0.4 {
+                return ret_skip("FILTER: weak bearish close - possible reversal");
+            }
+            if state.recent_bullish_streak >= 2 && current_candle.close >= current_candle.open {
+                return ret_skip("FILTER: bullish streak with weak candle - avoid SELL");
+            }
+        } else {
+            debug!("SCALP MODE: bypassing candle reversal filters for SHORT");
         }
     }
     
@@ -1278,14 +1286,20 @@ pub fn should_trade(
         Direction::None => (0.0, 0.0),
     };
     
-    // Verify TP >= 1.5 * SL
-    let sl_dist = (stop_loss - entry_price).abs();
-    let tp_dist = (take_profit - entry_price).abs();
-    if tp_dist < sl_dist * 1.5 {
-        return ret_skip(&format!(
-            "FILTER: TP validation failed ({:.2} vs min {:.2})",
-            tp_dist, sl_dist * 1.5
-        ));
+    // Verify TP >= required_ratio * SL
+    // In scalp_mode we SKIP TP validation entirely to favor faster entries
+    if cfg.scalp_mode {
+        debug!("SCALP MODE: skipping TP validation (allowing any TP/SL ratio)");
+    } else {
+        let sl_dist = (stop_loss - entry_price).abs();
+        let tp_dist = (take_profit - entry_price).abs();
+        let required_ratio = 1.5;
+        if tp_dist < sl_dist * required_ratio {
+            return ret_skip(&format!(
+                "FILTER: TP validation failed ({:.2} vs min {:.2})",
+                tp_dist, sl_dist * required_ratio
+            ));
+        }
     }
     
     // ============================================================
