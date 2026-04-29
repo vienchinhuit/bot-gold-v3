@@ -48,7 +48,7 @@ SLACK_NOTIFY_PORT = 5557  # Port de gui close notifications den Rust engine (0 =
 AUTO_ADD_STOPS = True
 # Default stops in pips (can be overridden via CLI)
 DEFAULT_SL_PIPS = 60.0   # 60 pips -> with pip_value 0.01 => 0.60 price
-DEFAULT_TP_PIPS = 120.0  # 120 pips
+DEFAULT_TP_PIPS = 200.0  # 200 pips (fixed TP in pips)
 PIP_VALUE = 0.01
 
 # If true, only add missing SL/TP (if missing or zero)
@@ -138,7 +138,7 @@ class SlackNotifier:
             try:
                 # Build simple Slack payload (use default channel if channel not prefixed)
                 payload = {
-                    "text": f"POSITION CLOSED | #{ticket} {direction} {volume} lots @ {price:.2f} | P&L: ${profit:+.2f} | Reason: {reason}",
+                    "text": text,
                 }
                 # If channel looks like '#... or @...', include it
                 if channel and (channel.startswith('#') or channel.startswith('@')):
@@ -146,13 +146,13 @@ class SlackNotifier:
                 import requests
                 resp = requests.post(webhook, json=payload, timeout=10)
                 if resp.status_code >= 200 and resp.status_code < 300:
-                    print(f"  [SLACK] Direct webhook sent for #{ticket} ({resp.status_code})")
+                    print(f"  [SLACK] Direct webhook sent ({resp.status_code})")
                 else:
                     print(f"  [SLACK] Direct webhook failed: {resp.status_code} {resp.text}")
             except Exception as e:
                 print(f"  [SLACK] Direct webhook exception: {e}")
         else:
-            print(f"  [SLACK] No ZMQ socket and no SLACK_WEBHOOK env var - cannot notify for #{ticket}")
+            print(f"  [SLACK] No ZMQ socket and no SLACK_WEBHOOK env var - cannot send status")
     
     def close(self):
         if self.socket:
@@ -460,8 +460,11 @@ def main():
     parser.add_argument('--status-interval', type=float, default=None, help='Status publish interval in seconds (default 1.0)')
     parser.add_argument('--auto-add-stops', action='store_true', help='Automatically add SL/TP to positions missing them')
     parser.add_argument('--sl-pips', type=float, default=None, help='Default SL in pips to add when missing (default: 60)')
-    parser.add_argument('--tp-pips', type=float, default=None, help='Default TP in pips to add when missing (default: 120)')
+    parser.add_argument('--tp-pips', type=float, default=None, help='Default TP in pips to add when missing (default: 200)')
     parser.add_argument('--pip-value', type=float, default=None, help='Pip value for symbol (default 0.01)')
+    parser.add_argument('--sl-mult', type=float, default=None, help='SL multiplier of ATR (default: 1.2)')
+    parser.add_argument('--atr-period', type=int, default=None, help='ATR period used to compute SL (default: 14)')
+    parser.add_argument('--history-count', type=int, default=None, help='Number of candles requested for ATR/history (default: 100)')
     args = parser.parse_args()
     global OM_DEBUG, STATUS_INTERVAL, AUTO_ADD_STOPS, DEFAULT_SL_PIPS, DEFAULT_TP_PIPS, PIP_VALUE
     if args.debug:
@@ -476,8 +479,14 @@ def main():
         DEFAULT_TP_PIPS = float(args.tp_pips)
     if args.pip_value is not None:
         PIP_VALUE = float(args.pip_value)
+    if args.sl_mult is not None:
+        SL_MULT = float(args.sl_mult)
+    if args.atr_period is not None:
+        ATR_PERIOD = int(args.atr_period)
+    if args.history_count is not None:
+        HISTORY_COUNT = int(args.history_count)
 
-    dbg(f"CLI args: debug={args.debug} notify_port={args.notify_port} status_interval={args.status_interval} auto_add_stops={args.auto_add_stops} sl_pips={args.sl_pips} tp_pips={args.tp_pips} pip_value={args.pip_value}")
+    dbg(f"CLI args: debug={args.debug} notify_port={args.notify_port} status_interval={args.status_interval} auto_add_stops={args.auto_add_stops} sl_pips={args.sl_pips} tp_pips={args.tp_pips} pip_value={args.pip_value} sl_mult={args.sl_mult} atr_period={args.atr_period} history_count={args.history_count}")
 
     notify_port = args.notify_port if args.notify_port is not None else SLACK_NOTIFY_PORT
 
