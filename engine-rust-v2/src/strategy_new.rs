@@ -1156,8 +1156,13 @@ pub fn should_trade(
     // ============================================================
     // STEP 12: FILTER 8 - No-trade zone
     // ============================================================
-    if is_in_no_trade_zone(price, &state.recent_trade_prices, cfg.no_trade_zone_pips, cfg.pip_value) {
-        return ret_skip("FILTER: No-trade zone (recent trade price)");
+    if cfg.scalp_mode {
+        // In scalp mode we disable no-trade zone to allow quick re-entry
+        debug!("SCALP MODE: skipping No-trade zone check");
+    } else {
+        if is_in_no_trade_zone(price, &state.recent_trade_prices, cfg.no_trade_zone_pips, cfg.pip_value) {
+            return ret_skip("FILTER: No-trade zone (recent trade price)");
+        }
     }
     
     // ============================================================
