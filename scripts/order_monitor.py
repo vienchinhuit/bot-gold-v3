@@ -473,6 +473,10 @@ def main():
     profit_closed_count = 0
     profit_closed_pnl = 0.0
     i = 0
+
+    # Batch summary print timer (every N seconds)
+    BATCH_PRINT_SEC = 5
+    last_batch_print = 0.0
     
     try:
         while True:
@@ -551,7 +555,7 @@ def main():
                 # Doc batch info tu file JSON
                 batch_info = load_batch_info()
                 
-                # Build batch/group aggregates (no periodic printing)
+                                # Build batch/group aggregates
                 batch_info = load_batch_info()
                 total_closed_pnl = 0.0
                 total_closed_count = 0
@@ -571,6 +575,22 @@ def main():
                     # Kiem tra neu batch dat target thi dong toan bo
                     if BATCH_PROFIT_TARGET > 0 and total_batch_pnl >= BATCH_PROFIT_TARGET:
                         batches_to_close.append({'magic': magic, 'pos_list': pos_list, 'total_pnl': total_batch_pnl})
+
+                # Periodic batch summary printing every BATCH_PRINT_SEC seconds
+                try:
+                    if time.time() - last_batch_print >= BATCH_PRINT_SEC:
+                        print('\n--- BATCH SUMMARY (every {}s) ---'.format(BATCH_PRINT_SEC))
+                        for magic, pos_list in magic_groups.items():
+                            open_pnl = sum(p.get('profit', 0) for p in pos_list)
+                            open_count = len(pos_list)
+                            closed_count = batch_info.get(str(magic), {}).get('closed_count', 0)
+                            closed_pnl = batch_info.get(str(magic), {}).get('closed_pnl', 0.0)
+                            target = batch_info.get(str(magic), {}).get('pnl_target', '?')
+                            print(f"  Magic#{magic}: OpenPositions={open_count} OpenPNL={open_pnl:+.2f} ClosedCount={closed_count} ClosedPNL={closed_pnl:+.2f} Target={target}")
+                        last_batch_print = time.time()
+                except Exception as e:
+                    dbg(f"Batch summary print failed: {e}")
+
 
                 # If new positions appeared, print concise info about them
                 new_positions = current_tickets - last_seen_tickets
