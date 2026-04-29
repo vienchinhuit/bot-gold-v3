@@ -175,9 +175,17 @@ struct Args {
                 #[arg(long, default_value_t = false)]
                 loose_start: bool,
 
-                /// Enable scalping preset: apply aggressive scalping-friendly parameters
+                                /// Enable scalping preset: apply aggressive scalping-friendly parameters
                 #[arg(long, default_value_t = false)]
                 scalp_mode: bool,
+
+                /// When scalp_mode is enabled, override SL distance (in pips)
+                #[arg(long, default_value_t = 150.0)]
+                scalp_sl_pips: f64,
+
+                /// When scalp_mode is enabled, override TP distance (in pips)
+                #[arg(long, default_value_t = 200.0)]
+                scalp_tp_pips: f64,
 
                 /// Log per-tick analysis (debug-level) each tick
         #[arg(long, default_value_t = false)]
@@ -347,8 +355,11 @@ fn main() {
     info!("Symbol: {} (input: {}) | Trading: {}", resolved_symbol, args.symbol, if args.trade { "ENABLED" } else { "DISABLED" });
     info!("Filters: Sideway={} | Trend={} | Pullback={}pips | FOMO={}pips",
         args.sideway_threshold, args.min_trend_strength, args.max_pullback_pips, args.max_fomo_pips);
-        info!("Risk: SL={}*ATR | TP={}*ATR | MinScore={} | MinConf={:.2}",
+                info!("Risk: SL={}*ATR | TP={}*ATR | MinScore={} | MinConf={:.2}",
         args.sl_mult, args.tp_mult, args.min_score, args.min_confidence);
+    if args.scalp_mode {
+        info!("SCALP MODE OVERRIDES: SL={} pips | TP={} pips", args.scalp_sl_pips, args.scalp_tp_pips);
+    }
     info!("Volume: {}-{} lots/trade | MaxTotal={} lots",
         args.volume, args.max_volume_per_trade, args.max_total_volume);
         info!("Cooldown: {} candles | MaxLosses={} | Pause={}min",
@@ -1178,8 +1189,27 @@ fn main() {
 
 
 
-                                // RUN STRATEGY
-                                let signal = should_trade(&mut state, price, bid, ask, &current_candle, &config);
+                                                                // RUN STRATEGY
+                                let mut signal = should_trade(&mut state, price, bid, ask, &current_candle, &config);
+
+                                // If scalp_mode CLI override is enabled, force fixed SL/TP distances in pips
+                                if args.scalp_mode {
+                                    let pip = config.pip_value;
+                                    let entry = signal.entry_price;
+                                    if signal.is_enter() {
+                                        match signal.direction {
+                                            Direction::Long => {
+                                                signal.stop_loss = entry - args.scalp_sl_pips * pip;
+                                                signal.take_profit = entry + args.scalp_tp_pips * pip;
+                                            }
+                                            Direction::Short => {
+                                                signal.stop_loss = entry + args.scalp_sl_pips * pip;
+                                                signal.take_profit = entry - args.scalp_tp_pips * pip;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
 
                 
                 // Always log signal status
