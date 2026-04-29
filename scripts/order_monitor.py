@@ -414,6 +414,7 @@ def main():
     parser = argparse.ArgumentParser(description='Order Monitor')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug prints (overrides OM_DEBUG env var)')
     parser.add_argument('--notify-port', type=int, default=None, help='Override SLACK_NOTIFY_PORT (ZMQ PUB bind)')
+    parser.add_argument('--batch-print-sec', type=int, default=5, help='Batch summary interval seconds (0 to disable)')
     args = parser.parse_args()
     global OM_DEBUG
     if args.debug:
@@ -475,7 +476,8 @@ def main():
     i = 0
 
     # Batch summary print timer (every N seconds)
-    BATCH_PRINT_SEC = 5
+    # Controlled by CLI flag --batch-print-sec (0 to disable)
+    BATCH_PRINT_SEC = args.batch_print_sec if hasattr(args, 'batch_print_sec') else 5
     last_batch_print = 0.0
     
     try:

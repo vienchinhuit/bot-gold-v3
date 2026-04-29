@@ -1597,11 +1597,15 @@ fn main() {
                                                         let comment = if comment.len() > 27 { &comment[..27] } else { &comment };
                             
                                                                                                                 // Before sending order, query broker symbol info (stop level, point) via python_bridge
-                                                        let mut sl_to_send = signal.stop_loss;
+                                                                                                                let mut sl_to_send = signal.stop_loss;
                                                         let mut tp_to_send = signal.take_profit;
                                                         let pip = config.pip_value;
                                                         // Increase min stop distance slightly to avoid SL being placed too tight on low-ATR ticks
                             let mut min_stop_distance = 0.5_f64.max(state.atr.unwrap_or(0.0) * config.sl_mult * 1.2);
+
+                                                        // We'll try to fetch broker symbol info (point, digits, stop_level) and preserve them for precise rounding
+                                                        let mut symbol_point = pip;
+                                                        let mut symbol_digits: i32 = 2;
 
                                                         // Try to get symbol info from python bridge to determine stop level
                                                         let sym_req = serde_json::json!({ "type": "SYMBOL_INFO", "data": { "symbol": resolved_symbol } });
@@ -1615,27 +1619,29 @@ fn main() {
                                                                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
                                                                         if v.get("success").and_then(|x| x.as_bool()).unwrap_or(false) {
                                                                             if let Some(data) = v.get("data") {
-                                                                                // Extract point and stop_level if present
-                                                                                let point = data.get("point").and_then(|x| x.as_f64()).unwrap_or(config.pip_value);
+                                                                                // Extract point, digits and stop_level if present
+                                                                                symbol_point = data.get("point").and_then(|x| x.as_f64()).unwrap_or(pip);
+                                                                                symbol_digits = data.get("digits").and_then(|x| x.as_i64()).map(|d| d as i32).unwrap_or(symbol_digits);
                                                                                 let stop_level_opt = data.get("stop_level").and_then(|x| x.as_f64());
                                                                                 if let Some(stop_pts) = stop_level_opt {
-                                                                                    let stop_price = stop_pts * point;
+                                                                                    let stop_price = stop_pts * symbol_point;
                                                                                     if stop_price > 0.0 {
                                                                                         min_stop_distance = stop_price.max(min_stop_distance);
-                                                                                        debug!("Broker stop_level: {} pts, point={} => min_stop_distance set to {}", stop_pts, point, min_stop_distance);
+                                                                                        debug!("Broker stop_level: {} pts, point={} digits={} => min_stop_distance set to {}", stop_pts, symbol_point, symbol_digits, min_stop_distance);
                                                                                     }
                                                                                 }
                                                                             }
                                                                         } else if v.get("point").is_some() {
                                                                             // sometimes raw symbol dict returned without success wrapper
                                                                             let data = &v;
-                                                                            let point = data.get("point").and_then(|x| x.as_f64()).unwrap_or(config.pip_value);
+                                                                            symbol_point = data.get("point").and_then(|x| x.as_f64()).unwrap_or(pip);
+                                                                            symbol_digits = data.get("digits").and_then(|x| x.as_i64()).map(|d| d as i32).unwrap_or(symbol_digits);
                                                                             let stop_level_opt = data.get("stop_level").and_then(|x| x.as_f64());
                                                                             if let Some(stop_pts) = stop_level_opt {
-                                                                                let stop_price = stop_pts * point;
+                                                                                let stop_price = stop_pts * symbol_point;
                                                                                 if stop_price > 0.0 {
                                                                                     min_stop_distance = stop_price.max(min_stop_distance);
-                                                                                    debug!("Broker stop_level (raw): {} pts, point={} => min_stop_distance set to {}", stop_pts, point, min_stop_distance);
+                                                                                    debug!("Broker stop_level (raw): {} pts, point={} digits={} => min_stop_distance set to {}", stop_pts, symbol_point, symbol_digits, min_stop_distance);
                                                                                 }
                                                                             }
                                                                         }
@@ -1648,6 +1654,7 @@ fn main() {
 
                                                         // Add small buffer (one pip) to be safe
                                                         min_stop_distance += pip;
+
 
                                                         // Ensure SL/TP satisfy broker min distance and correct side
                                                         match signal.direction {
@@ -1677,45 +1684,119 @@ fn main() {
                                                             _ => {}
                                                         }
 
-                                                                                                                // Round stops to pip grid with directional rounding to ensure they are strictly beyond min_stop_distance
-                                                        fn round_down_to_pip(x: f64, pip: f64) -> f64 { (x / pip).floor() * pip }
-                                                        fn round_up_to_pip(x: f64, pip: f64) -> f64 { (x / pip).ceil() * pip }
+                                                                                                                // Robust rounding & validation of SL/TP using broker point/digits where available
+                                                                                                                // fall back to config.pip_value if symbol info not available
+                                                                                                                fn round_to_digits(x: f64, digits: i32) -> f64 {
+                                                                                                                    let factor = 10_f64.powi(digits);
+                                                                                                                    (x * factor).round() / factor
+                                                                                                                }
 
-                                                        // Add a larger extra buffer to move SL further away from entry (reduces premature SL hits)
-                                                                                                                // Increase this multiplier if you want SL even further away
+                                                                                                                fn round_floor_to_point(x: f64, point: f64, digits: i32) -> f64 {
+                                                                                                                    let v = (x / point).floor() * point;
+                                                                                                                    round_to_digits(v, digits)
+                                                                                                                }
+
+                                                                                                                fn round_ceil_to_point(x: f64, point: f64, digits: i32) -> f64 {
+                                                                                                                    let v = (x / point).ceil() * point;
+                                                                                                                    round_to_digits(v, digits)
+                                                                                                                }
+
+                                                                                                                // Use broker-provided point/digits if available
+                                                                                                                let point = symbol_point;
+                                                                                                                let digits = symbol_digits;
+
+                                                                                                                // Extra buffer to push SL further away (reduces invalid stops on some brokers)
                                                                                                                 let extra = pip * 4.0;
-                                                        match signal.direction {
-                                                            Direction::Long => {
-                                                                let entry = signal.entry_price;
-                                                                // ensure SL is at least min_stop_distance + extra away
-                                                                let desired_sl = entry - (min_stop_distance + extra);
-                                                                sl_to_send = round_down_to_pip(desired_sl, pip);
-                                                                // if rounding moved it too close, push one more pip away
-                                                                if (entry - sl_to_send) < min_stop_distance + 0.0000001 {
-                                                                    sl_to_send = round_down_to_pip(desired_sl - pip, pip);
-                                                                }
 
-                                                                // ensure TP is at least required ratio away and rounded up
-                                                                let sl_dist = (entry - sl_to_send).abs();
-                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
-                                                                let desired_tp = entry + tp_req + extra;
-                                                                tp_to_send = round_up_to_pip(desired_tp, pip);
-                                                            }
-                                                            Direction::Short => {
-                                                                let entry = signal.entry_price;
-                                                                let desired_sl = entry + (min_stop_distance + extra);
-                                                                sl_to_send = round_up_to_pip(desired_sl, pip);
-                                                                if (sl_to_send - entry) < min_stop_distance + 0.0000001 {
-                                                                    sl_to_send = round_up_to_pip(desired_sl + pip, pip);
-                                                                }
+                                                                                                                // Ensure strict validity: SL must be on correct side and at least min_stop_distance away from entry
+                                                                                                                match signal.direction {
+                                                                                                                    Direction::Long => {
+                                                                                                                        let entry = signal.entry_price;
+                                                                                                                        // Desired SL before rounding
+                                                                                                                        let mut desired_sl = entry - (min_stop_distance + extra);
 
-                                                                let sl_dist = (sl_to_send - entry).abs();
-                                                                let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
-                                                                let desired_tp = entry - tp_req - extra;
-                                                                tp_to_send = round_down_to_pip(desired_tp, pip);
-                                                            }
-                                                            _ => {}
-                                                        }
+                                                                                                                        // Round down to point/digits grid
+                                                                                                                        let mut attempt_sl = round_floor_to_point(desired_sl, point, digits);
+
+                                                                                                                        // If rounding moved SL inside min distance or not strictly below entry, push further away by one point up to 10 attempts
+                                                                                                                        let mut tries = 0;
+                                                                                                                        while (entry - attempt_sl) < (min_stop_distance + 1e-9) && tries < 10 {
+                                                                                                                            desired_sl -= point; // move further away
+                                                                                                                            attempt_sl = round_floor_to_point(desired_sl, point, digits);
+                                                                                                                            tries += 1;
+                                                                                                                        }
+
+                                                                                                                        // If still invalid, as a last resort set SL = entry - (min_stop_distance + point)
+                                                                                                                        if (entry - attempt_sl) < (min_stop_distance + 1e-9) {
+                                                                                                                            attempt_sl = round_floor_to_point(entry - (min_stop_distance + point), point, digits);
+                                                                                                                            debug!("SL adjustment fallback for LONG -> entry={} min_req={} attempt_sl={}", entry, min_stop_distance, attempt_sl);
+                                                                                                                        }
+
+                                                                                                                        sl_to_send = attempt_sl;
+
+                                                                                                                        // Now compute TP relative to actual SL distance to keep R:R
+                                                                                                                        let sl_dist = (entry - sl_to_send).abs();
+                                                                                                                        let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                                                                        let mut desired_tp = entry + tp_req + extra;
+                                                                                                                        let mut attempt_tp = round_ceil_to_point(desired_tp, point, digits);
+                                                                                                                        // Ensure TP is strictly above entry
+                                                                                                                        tries = 0;
+                                                                                                                        while (attempt_tp - entry) < 1e-9 && tries < 10 {
+                                                                                                                            desired_tp += point;
+                                                                                                                            attempt_tp = round_ceil_to_point(desired_tp, point, digits);
+                                                                                                                            tries += 1;
+                                                                                                                        }
+                                                                                                                        tp_to_send = attempt_tp;
+                                                                                                                    }
+                                                                                                                    Direction::Short => {
+                                                                                                                        let entry = signal.entry_price;
+                                                                                                                        let mut desired_sl = entry + (min_stop_distance + extra);
+                                                                                                                        let mut attempt_sl = round_ceil_to_point(desired_sl, point, digits);
+                                                                                                                        let mut tries = 0;
+                                                                                                                        while (attempt_sl - entry) < (min_stop_distance + 1e-9) && tries < 10 {
+                                                                                                                            desired_sl += point;
+                                                                                                                            attempt_sl = round_ceil_to_point(desired_sl, point, digits);
+                                                                                                                            tries += 1;
+                                                                                                                        }
+                                                                                                                        if (attempt_sl - entry) < (min_stop_distance + 1e-9) {
+                                                                                                                            attempt_sl = round_ceil_to_point(entry + (min_stop_distance + point), point, digits);
+                                                                                                                            debug!("SL adjustment fallback for SHORT -> entry={} min_req={} attempt_sl={}", entry, min_stop_distance, attempt_sl);
+                                                                                                                        }
+                                                                                                                        sl_to_send = attempt_sl;
+
+                                                                                                                        let sl_dist = (sl_to_send - entry).abs();
+                                                                                                                        let tp_req = sl_dist * (config.tp_mult / config.sl_mult);
+                                                                                                                        let mut desired_tp = entry - tp_req - extra;
+                                                                                                                        let mut attempt_tp = round_floor_to_point(desired_tp, point, digits);
+                                                                                                                        tries = 0;
+                                                                                                                        while (entry - attempt_tp) < 1e-9 && tries < 10 {
+                                                                                                                            desired_tp -= point;
+                                                                                                                            attempt_tp = round_floor_to_point(desired_tp, point, digits);
+                                                                                                                            tries += 1;
+                                                                                                                        }
+                                                                                                                        tp_to_send = attempt_tp;
+                                                                                                                    }
+                                                                                                                    _ => {}
+                                                                                                                }
+
+
+                                                                                                                // Final sanity check: ensure stops are not equal to entry and are on correct side
+                                                                                                                if signal.direction == Direction::Long {
+                                                                                                                    if !(sl_to_send < signal.entry_price - 1e-9) {
+                                                                                                                        warn!("FINAL CHECK FAILED: LONG SL not strictly below entry (entry={} sl={})", signal.entry_price, sl_to_send);
+                                                                                                                    }
+                                                                                                                    if !(tp_to_send > signal.entry_price + 1e-9) {
+                                                                                                                        warn!("FINAL CHECK FAILED: LONG TP not strictly above entry (entry={} tp={})", signal.entry_price, tp_to_send);
+                                                                                                                    }
+                                                                                                                } else if signal.direction == Direction::Short {
+                                                                                                                    if !(sl_to_send > signal.entry_price + 1e-9) {
+                                                                                                                        warn!("FINAL CHECK FAILED: SHORT SL not strictly above entry (entry={} sl={})", signal.entry_price, sl_to_send);
+                                                                                                                    }
+                                                                                                                    if !(tp_to_send < signal.entry_price - 1e-9) {
+                                                                                                                        warn!("FINAL CHECK FAILED: SHORT TP not strictly below entry (entry={} tp={})", signal.entry_price, tp_to_send);
+                                                                                                                    }
+                                                                                                                }
+
 
                                                         let payload = serde_json::json!({
                                                             "type": "ORDER_SEND",
