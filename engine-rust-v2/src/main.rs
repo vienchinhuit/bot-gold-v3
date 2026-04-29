@@ -1865,21 +1865,31 @@ fn main() {
                                 } else { break; }
                             }
 
+                                                        // If there are no open positions currently, reset the rate window
+                            if open_positions == 0 {
+                                if !order_timestamps.is_empty() {
+                                    debug!("No open positions: clearing order rate window ({} entries)", order_timestamps.len());
+                                    order_timestamps.clear();
+                                }
+                            }
+
                             if order_timestamps.len() >= MAX_ORDERS_PER_WINDOW {
-                                info!("⚠️ Order rate limit reached: {} orders in {}s window - skipping order", MAX_ORDERS_PER_WINDOW, WINDOW_SEC);
+                                info!("⚠️ Order rate limit reached: {} orders in {}s window - skipping order (recent_count={})", MAX_ORDERS_PER_WINDOW, WINDOW_SEC, order_timestamps.len());
                                 continue;
                             }
 
-                            match sock.send(s.as_bytes(), 0) {
-                                Ok(_) => {
-                                    // Count this attempt (record timestamp) immediately after successful send
-                                    order_timestamps.push_back(Instant::now());
 
+                                                        match sock.send(s.as_bytes(), 0) {
+                                Ok(_) => {
+                                    // Wait for reply from bridge
                                     match sock.recv_string(0) {
                                         Ok(Ok(resp)) => {
                                             info!("📥 Order response: {}", resp);
                                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
                                                 if v.get("success").and_then(|x| x.as_bool()).unwrap_or(false) {
+                                                    // Record this successful execution in the rate window
+                                                    order_timestamps.push_back(Instant::now());
+
                                                     // Successful order - update state and notify Slack
                                                     state.record_trade(signal.entry_price, true);
                                                     if signal.direction == Direction::Long { state.long_positions += 1; }
@@ -1917,6 +1927,7 @@ fn main() {
                                                         }
                                                     }
                                                 } else {
+                                                    // Bridge reported failure - do NOT count this attempt towards successful-order quota
                                                     let err = v.get("error_message").or_else(|| v.get("error")).or_else(|| v.get("comment")).and_then(|x| x.as_str()).unwrap_or("<no error>");
                                                     warn!("ORDER FAILED from bridge: {}", err);
                                                 }
@@ -1930,6 +1941,7 @@ fn main() {
                                 }
                                 Err(e) => { error!("❌ Send failed: {:?}", e); }
                             }
+
 
                         }
                                         } else {
