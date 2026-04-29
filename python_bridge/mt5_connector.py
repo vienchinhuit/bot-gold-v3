@@ -228,6 +228,52 @@ class MT5Connector:
 
         return result
     
+    def _adjust_sl_tp(self, symbol: str, price: float, sl: float, tp: float, is_buy: bool):
+        """Adjust SL/TP to respect symbol's stop_level and price direction.
+
+        Returns adjusted (sl, tp) tuple. If stop_level info not available, returns inputs.
+        """
+        try:
+            info = self.get_symbol_info(symbol)
+            if not info:
+                return sl, tp
+
+            point = info.get('point', 0.0) or 0.0
+            stop_level = info.get('stop_level') or 0.0
+            # stop_level often expressed in points; compute minimum absolute distance
+            min_dist = (stop_level or 0.0) * (point or 1.0)
+            # Ensure at least one point distance
+            if min_dist <= 0:
+                min_dist = (point or 1.0) * 1.0
+
+            adj_sl = sl
+            adj_tp = tp
+
+            # Only adjust if values provided and > 0
+            if sl and sl > 0:
+                if is_buy:
+                    # sl must be sufficiently below price
+                    if price - sl < min_dist:
+                        adj_sl = max(0.0, price - (min_dist + (point or 0.0)))
+                else:
+                    # sl must be sufficiently above price
+                    if sl - price < min_dist:
+                        adj_sl = price + (min_dist + (point or 0.0))
+
+            if tp and tp > 0:
+                if is_buy:
+                    # tp must be sufficiently above price
+                    if tp - price < min_dist:
+                        adj_tp = price + (min_dist + (point or 0.0))
+                else:
+                    # tp must be sufficiently below price
+                    if price - tp < min_dist:
+                        adj_tp = max(0.0, price - (min_dist + (point or 0.0)))
+
+            return adj_sl, adj_tp
+        except Exception:
+            return sl, tp
+
     def send_order(self, request: OrderRequest) -> OrderResponse:
         """Send trading order to MT5."""
         # Map order type string to MT5 constant
@@ -293,15 +339,39 @@ class MT5Connector:
             "expiration": 0
         }
         
-        # Chỉ thêm SL/TP nếu có giá trị hợp lệ
-        if request.stop_loss and request.stop_loss > 0:
-            trade_request["sl"] = request.stop_loss
-        if request.take_profit and request.take_profit > 0:
-            trade_request["tp"] = request.take_profit
-        
+        # Prepare SL/TP values
+        sl = request.stop_loss if request.stop_loss and request.stop_loss > 0 else None
+        tp = request.take_profit if request.take_profit and request.take_profit > 0 else None
+
+        # Adjust SL/TP to respect stop level if present
+        try:
+            is_buy = 'BUY' in request.order_type.upper()
+            sl_adj, tp_adj = self._adjust_sl_tp(request.symbol, price, sl or 0.0, tp or 0.0, is_buy)
+            if sl_adj and sl_adj > 0:
+                trade_request["sl"] = sl_adj
+            if tp_adj and tp_adj > 0:
+                trade_request["tp"] = tp_adj
+        except Exception:
+            # Fallback to raw values
+            if sl:
+                trade_request["sl"] = sl
+            if tp:
+                trade_request["tp"] = tp
+
         # Send order
         result = mt5.order_send(trade_request)
         
+        # If invalid stops error, try again without SL/TP to avoid 'invalid stop' failures
+        invalid_stops_code = getattr(mt5, 'TRADE_RETCODE_INVALID_STOPS', None)
+        try:
+            if result is not None and invalid_stops_code is not None and getattr(result, 'retcode', None) == invalid_stops_code:
+                self._system_logger.warning(f"Order send returned INVALID_STOPS, retrying without SL/TP: {request.symbol}")
+                trade_request.pop('sl', None)
+                trade_request.pop('tp', None)
+                result = mt5.order_send(trade_request)
+        except Exception:
+            pass
+
         if result is None:
             error_code, error_text = mt5.last_error()
             self._system_logger.error(f"Order send failed: [{error_code}] {error_text}")
@@ -312,30 +382,30 @@ class MT5Connector:
                 error_message=error_text,
                 request_id=request.request_id
             )
-        
-        if result.retcode == mt5.TRADE_RETCODE_DONE:
+
+        if getattr(result, 'retcode', None) == mt5.TRADE_RETCODE_DONE:
             self._system_logger.info(
-                f"ORDER SENT: #{result.order} {request.order_type} {request.volume} lots "
+                f"ORDER SENT: #{getattr(result, 'order', 'N/A')} {request.order_type} {request.volume} lots "
                 f"{request.symbol} @ {price}"
             )
             return OrderResponse(
                 success=True,
                 message_type=MessageType.ORDER_SEND,
-                ticket=result.order,
+                ticket=getattr(result, 'order', None),
                 volume=request.volume,
                 price=price,
-                comment=result.comment,
+                comment=getattr(result, 'comment', ''),
                 request_id=request.request_id
             )
         else:
             self._system_logger.error(
-                f"Order failed: [{result.retcode}] {result.comment}"
+                f"Order failed: [{getattr(result, 'retcode', None)}] {getattr(result, 'comment', '')}"
             )
             return OrderResponse(
                 success=False,
                 message_type=MessageType.ORDER_SEND,
-                error_code=result.retcode,
-                error_message=result.comment,
+                error_code=getattr(result, 'retcode', None),
+                error_message=getattr(result, 'comment', ''),
                 request_id=request.request_id
             )
     
@@ -531,29 +601,54 @@ class MT5Connector:
         # Use existing values if not specified
         new_sl = stop_loss if stop_loss is not None else position.sl
         new_tp = take_profit if take_profit is not None else position.tp
+
+        # Adjust SL/TP to respect stop level and price
+        try:
+            # Determine if position is buy
+            is_buy = (position.type == mt5.POSITION_TYPE_BUY)
+            # Fetch current tick price for direction
+            tick = mt5.symbol_info_tick(position.symbol)
+            price = tick.ask if is_buy else tick.bid
+            adj_sl, adj_tp = self._adjust_sl_tp(position.symbol, price, new_sl or 0.0, new_tp or 0.0, is_buy)
+            use_sl = adj_sl if adj_sl and adj_sl > 0 else 0
+            use_tp = adj_tp if adj_tp and adj_tp > 0 else 0
+        except Exception:
+            use_sl = new_sl if new_sl else 0
+            use_tp = new_tp if new_tp else 0
         
         # Create trade request as dictionary
         trade_request = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": ticket,
-            "sl": new_sl if new_sl else 0,
-            "tp": new_tp if new_tp else 0,
+            "sl": use_sl,
+            "tp": use_tp,
             "deviation": 0,
             "type_filling": mt5.ORDER_FILLING_IOC
         }
         
         result = mt5.order_send(trade_request)
+
+        # If invalid stops error, try again with adjusted values removed
+        invalid_stops_code = getattr(mt5, 'TRADE_RETCODE_INVALID_STOPS', None)
+        try:
+            if result is not None and invalid_stops_code is not None and result.retcode == invalid_stops_code:
+                self._system_logger.warning(f"Modify position returned INVALID_STOPS, retrying without SL/TP: #{ticket}")
+                trade_request['sl'] = 0
+                trade_request['tp'] = 0
+                result = mt5.order_send(trade_request)
+        except Exception:
+            pass
         
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             self._system_logger.info(
-                f"POSITION MODIFIED: #{ticket} SL={new_sl} TP={new_tp}"
+                f"POSITION MODIFIED: #{ticket} SL={use_sl} TP={use_tp}"
             )
             return OrderResponse(
                 success=True,
                 message_type=MessageType.POSITION_MODIFY,
                 ticket=ticket,
-                price=new_sl,
-                comment=f"SL={new_sl}, TP={new_tp}",
+                price=use_sl,
+                comment=f"SL={use_sl}, TP={use_tp}",
                 request_id=str(ticket)
             )
         else:

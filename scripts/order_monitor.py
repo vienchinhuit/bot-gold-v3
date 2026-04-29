@@ -11,7 +11,6 @@ import json
 import time
 import threading
 import os
-import sys
 import argparse
 from collections import defaultdict
 from datetime import datetime
@@ -38,10 +37,6 @@ except Exception:
 SYMBOL = "GOLD"
 PORT = 5556
 CHECK_INTERVAL = 0.2  # Gian
-# Watchdog timeout (in seconds). If main loop doesn't update heartbeat within this interval,
-# the process will auto-restart. Set to 0 to disable. Default can be overridden by OM_WATCHDOG_TIMEOUT env var
-WATCHDOG_TIMEOUT = int(os.environ.get('OM_WATCHDOG_TIMEOUT', '60'))  # default 60s
-LAST_HEARTBEAT = time.time()
 
 # Slack notification settings (ZMQ PUB)
 SLACK_NOTIFY_PORT = 5557  # Port de gui close notifications den Rust engine (0 = disable)
@@ -135,11 +130,6 @@ class OrderClient:
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.DEALER)
         self.socket.connect(f"tcp://localhost:{port}")
-        # Ensure quick cleanup on restart/close (don't block on close)
-        try:
-            self.socket.setsockopt(zmq.LINGER, 0)
-        except Exception:
-            pass
         self.socket.setsockopt(zmq.RCVTIMEO, 5000)
         
         self._running = True
@@ -424,51 +414,16 @@ def main():
     parser = argparse.ArgumentParser(description='Order Monitor')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug prints (overrides OM_DEBUG env var)')
     parser.add_argument('--notify-port', type=int, default=None, help='Override SLACK_NOTIFY_PORT (ZMQ PUB bind)')
-    parser.add_argument('--batch-print-sec', type=int, default=5, help='Batch summary interval seconds (0 to disable)')
-    parser.add_argument('--watchdog-timeout', type=int, default=None, help='Watchdog timeout in seconds (override OM_WATCHDOG_TIMEOUT env var, 0 to disable)')
     args = parser.parse_args()
     global OM_DEBUG
     if args.debug:
         OM_DEBUG = True
-    dbg(f"CLI args: debug={args.debug} notify_port={args.notify_port} watchdog_timeout={args.watchdog_timeout}")
+    dbg(f"CLI args: debug={args.debug} notify_port={args.notify_port}")
 
     notify_port = args.notify_port if args.notify_port is not None else SLACK_NOTIFY_PORT
 
-    # Determine watchdog timeout (CLI overrides env)
-    watchdog_timeout = WATCHDOG_TIMEOUT
-    if args.watchdog_timeout is not None:
-        watchdog_timeout = args.watchdog_timeout
-    # Disable if 0 or negative
-    if watchdog_timeout is not None and watchdog_timeout <= 0:
-        watchdog_timeout = 0
-
     client = OrderClient(port=PORT)
     slack_notifier = SlackNotifier(port=notify_port)
-
-    # Start watchdog thread to auto-restart if main loop hangs
-    if watchdog_timeout and watchdog_timeout > 0:
-        import sys
-        def _watchdog_func(c, notifier, timeout):
-            global LAST_HEARTBEAT
-            try:
-                while True:
-                    # Wake up periodically (fraction of the timeout)
-                    time.sleep(max(1.0, timeout / 3.0))
-                    since = time.time() - LAST_HEARTBEAT
-                    if since > timeout:
-                        print(f"[WATCHDOG] No heartbeat for {since:.1f}s (> {timeout}s). Restarting process.")
-                        # Do not close/modify any tracked positions. Only re-exec the process to reset state.
-                        try:
-                            os.execv(sys.executable, [sys.executable] + sys.argv)
-                        except Exception as e:
-                            print(f"[WATCHDOG] execv failed: {e}. Exiting.")
-                            os._exit(3)
-            except Exception as e:
-                dbg(f"Watchdog thread exception: {e}")
-
-        wd_thr = threading.Thread(target=_watchdog_func, args=(client, slack_notifier, watchdog_timeout), daemon=True)
-        wd_thr.start()
-        print(f"Watchdog enabled: timeout={watchdog_timeout}s")
     
     # Reset batch info khi khoi chay
     batch_info = load_batch_info()
@@ -518,20 +473,10 @@ def main():
     profit_closed_count = 0
     profit_closed_pnl = 0.0
     i = 0
-
-    # Batch summary print timer (every N seconds)
-    # Controlled by CLI flag --batch-print-sec (0 to disable)
-    BATCH_PRINT_SEC = args.batch_print_sec if hasattr(args, 'batch_print_sec') else 5
-    last_batch_print = 0.0
     
     try:
         while True:
             positions = get_all_positions(client, SYMBOL)
-            # Update heartbeat so watchdog knows we're alive
-            try:
-                LAST_HEARTBEAT = time.time()
-            except Exception:
-                pass
             
             i += 1
             elapsed = round(i * CHECK_INTERVAL, 1)
@@ -606,7 +551,7 @@ def main():
                 # Doc batch info tu file JSON
                 batch_info = load_batch_info()
                 
-                                # Build batch/group aggregates
+                # Build batch/group aggregates (no periodic printing)
                 batch_info = load_batch_info()
                 total_closed_pnl = 0.0
                 total_closed_count = 0
@@ -626,22 +571,6 @@ def main():
                     # Kiem tra neu batch dat target thi dong toan bo
                     if BATCH_PROFIT_TARGET > 0 and total_batch_pnl >= BATCH_PROFIT_TARGET:
                         batches_to_close.append({'magic': magic, 'pos_list': pos_list, 'total_pnl': total_batch_pnl})
-
-                # Periodic batch summary printing every BATCH_PRINT_SEC seconds
-                try:
-                    if time.time() - last_batch_print >= BATCH_PRINT_SEC:
-                        print('\n--- BATCH SUMMARY (every {}s) ---'.format(BATCH_PRINT_SEC))
-                        for magic, pos_list in magic_groups.items():
-                            open_pnl = sum(p.get('profit', 0) for p in pos_list)
-                            open_count = len(pos_list)
-                            closed_count = batch_info.get(str(magic), {}).get('closed_count', 0)
-                            closed_pnl = batch_info.get(str(magic), {}).get('closed_pnl', 0.0)
-                            target = batch_info.get(str(magic), {}).get('pnl_target', '?')
-                            print(f"  Magic#{magic}: OpenPositions={open_count} OpenPNL={open_pnl:+.2f} ClosedCount={closed_count} ClosedPNL={closed_pnl:+.2f} Target={target}")
-                        last_batch_print = time.time()
-                except Exception as e:
-                    dbg(f"Batch summary print failed: {e}")
-
 
                 # If new positions appeared, print concise info about them
                 new_positions = current_tickets - last_seen_tickets
