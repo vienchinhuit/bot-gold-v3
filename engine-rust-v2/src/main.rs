@@ -218,7 +218,7 @@ struct Args {
         mt5_symbol: String,
 
         /// Maximum total open positions allowed at any time (long+short)
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = 50)]
         max_open_positions: usize,
 }
 
